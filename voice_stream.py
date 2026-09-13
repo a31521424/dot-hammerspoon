@@ -96,6 +96,55 @@ def wav_pcm(path: Path) -> bytes:
     return data[pos + 8 :]
 
 
+def join_segments(parts: list[str]) -> str:
+    """Join utterance segments from a single frame without repeating a rewrite."""
+    out = ""
+    for part in parts:
+        if not part:
+            continue
+        if not out:
+            out = part
+            continue
+        if part.startswith(out) or out in part:
+            out = part
+            continue
+        if out.startswith(part) or part in out:
+            continue
+        head = out[: min(6, len(out))]
+        if len(head) >= 2 and part.startswith(head):
+            out = part
+            continue
+        max_overlap = min(len(out), len(part), 16)
+        merged = None
+        for count in range(max_overlap, 1, -1):
+            if out.endswith(part[:count]):
+                merged = out + part[count:]
+                break
+        out = merged if merged else out + part
+    return out
+
+
+def assemble_utterances(utterances: list) -> str:
+    items = []
+    for item in utterances:
+        if not isinstance(item, dict):
+            continue
+        chunk = item.get("text")
+        if not isinstance(chunk, str) or not chunk:
+            continue
+        items.append((item.get("start_time") or 0, bool(item.get("definite")), chunk))
+    items.sort(key=lambda row: (row[0], not row[1]))
+    collapsed: list[tuple[int, bool, str]] = []
+    for start, definite, chunk in items:
+        if collapsed and collapsed[-1][0] == start:
+            prev_start, prev_definite, prev_chunk = collapsed[-1]
+            if len(chunk) >= len(prev_chunk) or (definite and not prev_definite):
+                collapsed[-1] = (prev_start, definite or prev_definite, chunk)
+            continue
+        collapsed.append((start, definite, chunk))
+    return join_segments([chunk for _, _, chunk in collapsed])
+
+
 def extract_text(raw: dict) -> str:
     result = raw.get("result")
     if not isinstance(result, dict):
@@ -103,36 +152,59 @@ def extract_text(raw: dict) -> str:
     text = result.get("text")
     if not isinstance(text, str):
         text = ""
-    definite = []
-    interim = []
     utterances = result.get("utterances")
-    if isinstance(utterances, list):
-        for item in utterances:
-            if not isinstance(item, dict) or not item.get("text"):
-                continue
-            chunk = str(item["text"])
-            if item.get("definite"):
-                definite.append(chunk)
-            else:
-                interim.append(chunk)
-    uttered = "".join(definite + interim)
-    if len(uttered) > len(text):
-        return uttered
-    return text
+    assembled = assemble_utterances(utterances) if isinstance(utterances, list) else ""
+    if assembled and text:
+        if assembled.startswith(text):
+            return assembled
+        return text
+    return text or assembled
 
 
 def merge_text(prev: str, incoming: str) -> str:
+    """Merge successive full-result frames. Revisions replace; never concat a rewrite."""
     if not incoming:
         return prev
-    if not prev:
+    if not prev or incoming == prev:
         return incoming
-    if incoming.startswith(prev) or prev.startswith(incoming):
-        return incoming if len(incoming) >= len(prev) else prev
-    overlap = min(len(prev), len(incoming), 24)
-    for count in range(overlap, 0, -1):
+    if incoming.startswith(prev):
+        return incoming
+    if prev.startswith(incoming):
+        return prev
+    if incoming in prev:
+        return prev
+    if prev in incoming:
+        return incoming
+    head_len = min(len(prev), len(incoming), 6)
+    if head_len >= 2 and incoming[:head_len] == prev[:head_len]:
+        return incoming
+    max_overlap = min(len(prev), len(incoming), 16)
+    for count in range(max_overlap, 1, -1):
         if prev.endswith(incoming[:count]):
+            if incoming.startswith(prev[: min(4, len(prev))]):
+                return incoming
             return prev + incoming[count:]
-    return incoming if len(incoming) >= len(prev) else prev + incoming
+    if len(incoming) * 2 < len(prev):
+        return prev + incoming
+    return incoming
+
+
+def collapse_repeats(text: str) -> str:
+    """If the same opening phrase restarts many times, keep the last copy."""
+    if len(text) < 36:
+        return text
+    head = text[:18]
+    starts = []
+    pos = 0
+    while True:
+        found = text.find(head, pos)
+        if found < 0:
+            break
+        starts.append(found)
+        pos = found + 1
+    if len(starts) < 3:
+        return text
+    return text[starts[-1] :]
 
 
 def parse_frame(data: bytes) -> dict:
@@ -278,8 +350,10 @@ async def run(folder: Path, url: str, resource: str, api_key: str) -> int:
                         return
                     text = frame.get("text") or ""
                     if text:
-                        latest = merge_text(latest, text)
-                        emit({"event": "final" if frame.get("is_last") else "partial", "text": latest})
+                        merged = collapse_repeats(merge_text(latest, text))
+                        if merged != latest:
+                            latest = merged
+                            emit({"event": "final" if frame.get("is_last") else "partial", "text": latest})
                     if frame.get("is_last"):
                         return
 

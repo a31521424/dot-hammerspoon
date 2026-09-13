@@ -5,6 +5,8 @@
 -- A preview card shows the full transcript. Releasing the key stops
 -- recording; after the stream (or leftover Flash) finishes, the
 -- preview closes and the complete text is pasted at the caret.
+-- System output is muted while listening so speaker audio is not
+-- captured again by the microphone.
 local M = {}
 
 local log = hs.logger.new("voice-input", "debug")
@@ -53,6 +55,27 @@ local function joinTranscript(left, right)
     end
   end
   return left .. right
+end
+
+local function collapseRunawayRepeat(text)
+  if type(text) ~= "string" or #text < 36 then
+    return text
+  end
+  local head = text:sub(1, 18)
+  local starts = {}
+  local pos = 1
+  while true do
+    local found = text:find(head, pos, true)
+    if found == nil then
+      break
+    end
+    starts[#starts + 1] = found
+    pos = found + 1
+  end
+  if #starts < 3 then
+    return text
+  end
+  return text:sub(starts[#starts])
 end
 
 local function previewText(text)
@@ -118,6 +141,7 @@ local DEFAULT_RESOURCE_ID = "volc.seedasr.auc"
 local DEFAULT_STREAM_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 local DEFAULT_STREAM_RESOURCE_ID = "volc.seedasr.sauc.duration"
 local STREAM_TIMEOUT = 10
+local MUTE_HOLD_SECONDS = 0.18
 
 local function listAudioDevices(ffmpeg)
   local command = string.format(
@@ -890,6 +914,8 @@ function M.start(options)
     streamDone = false,
     polishing = false,
     finished = false,
+    outputGuard = nil,
+    outputToken = 0,
     ui = makeUI(),
   }
 
@@ -930,6 +956,82 @@ function M.start(options)
     end
   end
 
+  -- The ASR API cannot separate speaker playback from the mic. Mute the
+  -- default output only after a short hold so a tap cannot race restore.
+  local function mutePlayback()
+    state.outputToken = (state.outputToken or 0) + 1
+    local token = state.outputToken
+    hs.timer.doAfter(MUTE_HOLD_SECONDS, function()
+      if token ~= state.outputToken or not state.active or state.stopping or state.failed then
+        dbg("output mute skipped token=%d active=%s stopping=%s",
+          token, tostring(state.active), tostring(state.stopping))
+        return
+      end
+      if state.outputGuard ~= nil then
+        return
+      end
+      local output = hs.audiodevice.defaultOutputDevice()
+      if output == nil then
+        dbg("output mute skipped no_device")
+        return
+      end
+      local muted = false
+      local volume = nil
+      pcall(function()
+        muted = output:muted() == true
+      end)
+      pcall(function()
+        volume = output:volume()
+      end)
+      state.outputGuard = {
+        uid = output:uid(),
+        muted = muted,
+        volume = volume,
+      }
+      local ok = pcall(function()
+        output:setMuted(true)
+      end)
+      dbg("output mute ok=%s uid=%s was_muted=%s vol=%s",
+        tostring(ok), tostring(state.outputGuard.uid), tostring(muted), tostring(volume))
+    end)
+  end
+
+  local function restorePlayback()
+    state.outputToken = (state.outputToken or 0) + 1
+    local guard = state.outputGuard
+    if guard == nil then
+      return
+    end
+    state.outputGuard = nil
+    local output = nil
+    if guard.uid ~= nil then
+      output = hs.audiodevice.findDeviceByUID(guard.uid)
+    end
+    if output == nil then
+      output = hs.audiodevice.defaultOutputDevice()
+    end
+    if output == nil then
+      dbg("output restore skipped no_device")
+      return
+    end
+    if guard.muted then
+      pcall(function()
+        output:setMuted(true)
+      end)
+    else
+      pcall(function()
+        output:setMuted(false)
+      end)
+    end
+    if guard.volume ~= nil then
+      pcall(function()
+        output:setVolume(guard.volume)
+      end)
+    end
+    dbg("output restore uid=%s muted=%s vol=%s",
+      tostring(guard.uid), tostring(guard.muted), tostring(guard.volume))
+  end
+
   local function fail(message)
     if state.failed then
       return
@@ -943,6 +1045,7 @@ function M.start(options)
     state.pendingFinal = false
     log.e(message)
     stopTimers()
+    restorePlayback()
     killStream()
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
@@ -981,6 +1084,10 @@ function M.start(options)
 
   local function applyTranscript(text)
     if text == nil or text == "" then
+      return
+    end
+    text = collapseRunawayRepeat(text)
+    if text == state.utteranceCommitted then
       return
     end
     dbg("apply preview session_len=%d window_len=%d text_len=%d preview=%s",
@@ -1070,6 +1177,7 @@ function M.start(options)
     state.pendingFinal = false
     state.finalStarted = false
     stopTimers()
+    restorePlayback()
     cleanupCapture()
     if state.ui ~= nil then
       state.ui:hide()
@@ -1437,6 +1545,7 @@ function M.start(options)
     dbg("stop gen=%d pcm=%d preview_len=%d", gen, #state.pcmBuffer, #sessionTranscript())
     state.active = false
     state.stopping = true
+    restorePlayback()
     if state.liveTimer ~= nil then
       state.liveTimer:stop()
       state.liveTimer = nil
@@ -1530,6 +1639,7 @@ function M.start(options)
     state.ui:setTranscript("")
     state.ui:setLevel(0)
     state.ui:show()
+    mutePlayback()
 
     -- hs.task cannot stream binary PCM, and a single s16le/wav file is not
     -- flushed until ffmpeg exits cleanly. Short WAV segments survive stop.
