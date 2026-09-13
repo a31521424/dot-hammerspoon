@@ -1093,6 +1093,9 @@ function M.start(options)
     finished = false,
     outputGuard = nil,
     outputToken = 0,
+    daemonTask = nil,
+    daemonSocketPath = "/tmp/hammerspoon_voice_stream.sock",
+    streamSocket = nil,
     ui = makeUI(),
   }
 
@@ -1115,6 +1118,10 @@ function M.start(options)
   end
 
   local function killStream()
+    if state.streamSocket ~= nil then
+      pcall(function() state.streamSocket:disconnect() end)
+      state.streamSocket = nil
+    end
     if state.streamTask ~= nil and state.streamTask:isRunning() then
       state.streamTask:terminate()
     end
@@ -1568,7 +1575,7 @@ function M.start(options)
   end
 
   local function handleStreamLine(line)
-    if line == nil or line == "" then
+    if line == nil or line == "" or state.finished then
       return
     end
     local ok, msg = pcall(hs.json.decode, line)
@@ -1592,10 +1599,18 @@ function M.start(options)
     if event == "done" then
       state.streamDone = true
       dbg("stream done preview_len=%d", #sessionTranscript())
+      if state.streamSocket ~= nil then
+        pcall(function() state.streamSocket:disconnect() end)
+        state.streamSocket = nil
+      end
       return
     end
     if event == "error" then
       dbg("stream error %s", tostring(msg.message))
+      if state.streamSocket ~= nil then
+        pcall(function() state.streamSocket:disconnect() end)
+        state.streamSocket = nil
+      end
       if sessionTranscript() == "" and state.active and not state.stopping then
         killStream()
         startFlashLive()
@@ -1604,6 +1619,35 @@ function M.start(options)
       if sessionTranscript() == "" then
         fail(msg.message or "Streaming ASR failed")
       end
+    end
+  end
+
+  local function ensureDaemon()
+    if state.streamPython == nil or hs.fs.attributes(state.streamScript, "mode") ~= "file" then
+      return
+    end
+    if state.daemonTask ~= nil and state.daemonTask:isRunning() then
+      return
+    end
+    local args = {
+      state.streamScript,
+      "--daemon",
+      "--socket", state.daemonSocketPath,
+    }
+    state.daemonTask = hs.task.new(state.streamPython, function(code, stdout, stderr)
+      dbg("daemon exit code=%s", tostring(code))
+      state.daemonTask = nil
+    end, function(_, stdout, stderr)
+      if stderr and stderr ~= "" then
+        dbg("daemon stderr %s", previewText(stderr))
+      end
+      return true
+    end, args)
+    if not state.daemonTask:start() then
+      dbg("daemon start_failed")
+      state.daemonTask = nil
+    else
+      dbg("daemon started pid=%s", tostring(state.daemonTask:pid()))
     end
   end
 
@@ -1617,85 +1661,141 @@ function M.start(options)
     state.streamReady = false
     state.streamDone = false
     state.streamBuf = ""
-    local keyFile = state.segmentDir .. "/.apikey"
-    local keyHandle = io.open(keyFile, "w")
-    if keyHandle ~= nil then
-      keyHandle:write(state.apiKey)
-      keyHandle:close()
-    end
-    local hotFile = state.segmentDir .. "/.hotwords.json"
-    local hotHandle = io.open(hotFile, "w")
-    if hotHandle ~= nil then
-      local items = {}
-      for _, word in ipairs(state.hotwords) do
-        items[#items + 1] = { word = word }
+
+    local function startViaTask()
+      local keyFile = state.segmentDir .. "/.apikey"
+      local keyHandle = io.open(keyFile, "w")
+      if keyHandle ~= nil then
+        keyHandle:write(state.apiKey)
+        keyHandle:close()
       end
-      hotHandle:write(hs.json.encode({ hotwords = items }))
-      hotHandle:close()
-    end
-    local args = {
-      state.streamScript,
-      "--dir", state.segmentDir,
-      "--url", state.streamURL,
-      "--resource", state.streamResourceID,
-      "--key-file", keyFile,
-      "--hotwords-file", hotFile,
-    }
-    state.streamTask = hs.task.new(state.streamPython, function(code, stdout, stderr)
-      if state.generation ~= gen then
-        return
-      end
-      if stdout ~= nil and stdout ~= "" then
-        state.streamBuf = (state.streamBuf or "") .. stdout
-      end
-      if state.streamBuf ~= nil and state.streamBuf ~= "" then
-        for line in (state.streamBuf .. "\n"):gmatch("(.-)\n") do
-          handleStreamLine(line)
+      local hotFile = state.segmentDir .. "/.hotwords.json"
+      local hotHandle = io.open(hotFile, "w")
+      if hotHandle ~= nil then
+        local items = {}
+        for _, word in ipairs(state.hotwords) do
+          items[#items + 1] = { word = word }
         end
-        state.streamBuf = ""
+        hotHandle:write(hs.json.encode({ hotwords = items }))
+        hotHandle:close()
       end
-      if stderr ~= nil and stderr ~= "" then
-        dbg("stream exit_err %s", previewText(stderr))
-      end
-      dbg("stream exit code=%s ready=%s done=%s", tostring(code), tostring(state.streamReady), tostring(state.streamDone))
-      state.streamTask = nil
-      if state.failed then
-        return
-      end
-      if state.stopping or state.streamDone then
-        polishWithFlash(gen)
-        return
-      end
-      if sessionTranscript() == "" then
-        startFlashLive()
-      end
-    end, function(_, stdout, stderr)
-      if stderr ~= nil and stderr ~= "" then
-        for errLine in stderr:gmatch("[^\n]+") do
-          dbg("stream stderr %s", previewText(errLine))
+      local args = {
+        state.streamScript,
+        "--dir", state.segmentDir,
+        "--url", state.streamURL,
+        "--resource", state.streamResourceID,
+        "--key-file", keyFile,
+        "--hotwords-file", hotFile,
+      }
+      state.streamTask = hs.task.new(state.streamPython, function(code, stdout, stderr)
+        if state.generation ~= gen then
+          return
         end
-      end
-      if stdout ~= nil and stdout ~= "" then
-        state.streamBuf = state.streamBuf .. stdout
-        while true do
-          local pos = state.streamBuf:find("\n", 1, true)
-          if pos == nil then
-            break
+        if stdout ~= nil and stdout ~= "" then
+          state.streamBuf = (state.streamBuf or "") .. stdout
+        end
+        if state.streamBuf ~= nil and state.streamBuf ~= "" then
+          for line in (state.streamBuf .. "\n"):gmatch("(.-)\n") do
+            handleStreamLine(line)
           end
-          local line = state.streamBuf:sub(1, pos - 1)
-          state.streamBuf = state.streamBuf:sub(pos + 1)
-          handleStreamLine(line)
+          state.streamBuf = ""
         end
+        if stderr ~= nil and stderr ~= "" then
+          dbg("stream exit_err %s", previewText(stderr))
+        end
+        dbg("stream exit code=%s ready=%s done=%s", tostring(code), tostring(state.streamReady), tostring(state.streamDone))
+        state.streamTask = nil
+        if state.failed or state.finished then
+          return
+        end
+        if state.polishing then
+          dbg("stream exit, flash polish in progress")
+          return
+        end
+        if state.stopping or state.streamDone then
+          polishWithFlash(gen)
+          return
+        end
+        if sessionTranscript() == "" then
+          startFlashLive()
+        end
+      end, function(_, stdout, stderr)
+        if stderr ~= nil and stderr ~= "" then
+          for errLine in stderr:gmatch("[^\n]+") do
+            dbg("stream stderr %s", previewText(errLine))
+          end
+        end
+        if stdout ~= nil and stdout ~= "" then
+          state.streamBuf = state.streamBuf .. stdout
+          while true do
+            local pos = state.streamBuf:find("\n", 1, true)
+            if pos == nil then
+              break
+            end
+            local line = state.streamBuf:sub(1, pos - 1)
+            state.streamBuf = state.streamBuf:sub(pos + 1)
+            handleStreamLine(line)
+          end
+        end
+        return true
+      end, args)
+      if not state.streamTask:start() then
+        dbg("stream start_failed")
+        state.streamTask = nil
+        startFlashLive()
+        return
       end
-      return true
-    end, args)
-    if not state.streamTask:start() then
-      dbg("stream start_failed")
-      state.streamTask = nil
-      startFlashLive()
-      return
+      dbg("stream start (task) gen=%d resource=%s", gen, state.streamResourceID)
     end
-    dbg("stream start gen=%d resource=%s", gen, state.streamResourceID)
+
+    ensureDaemon()
+    local socketMode = hs.fs.attributes(state.daemonSocketPath, "mode")
+    if socketMode == "socket" then
+      local sock = hs.socket.new()
+      sock:setTimeout(10)
+      sock:setCallback(function(data, tag)
+        if state.generation ~= gen or state.finished then
+          return
+        end
+        if data ~= nil and data ~= "" then
+          for line in data:gmatch("[^\r\n]+") do
+            handleStreamLine(line)
+          end
+          if not state.streamDone and not state.finished then
+            sock:read("\n")
+          end
+        end
+      end)
+      local connected = sock:connect(state.daemonSocketPath, function()
+        if state.generation ~= gen or state.finished then
+          sock:disconnect()
+          return
+        end
+        state.streamSocket = sock
+        local hotItems = {}
+        for _, word in ipairs(state.hotwords) do
+          hotItems[#hotItems + 1] = { word = word }
+        end
+        local req = {
+          action = "start",
+          dir = state.segmentDir,
+          url = state.streamURL,
+          resource = state.streamResourceID,
+          api_key = state.apiKey,
+          hotwords = hotItems,
+        }
+        sock:write(hs.json.encode(req) .. "\n")
+        sock:read("\n")
+        dbg("stream start (daemon) gen=%d resource=%s", gen, state.streamResourceID)
+      end)
+      if not connected then
+        dbg("stream daemon connect returned nil, fallback to task")
+        startViaTask()
+      end
+    else
+      startViaTask()
+    end
+
     hs.timer.doAfter(2.2, function()
       if state.generation == gen and state.active and state.usingStream and not state.streamReady then
         dbg("stream ready_timeout fallback_flash")
@@ -1747,10 +1847,15 @@ function M.start(options)
     end
     if state.ui ~= nil then
       state.ui:setFinishing(true)
-      state.ui:setStatus("正在完成识别")
+      state.ui:setStatus("正在校对")
       refreshPreview()
     end
     writeStopFile()
+    if state.streamSocket ~= nil and state.streamSocket:connected() then
+      pcall(function()
+        state.streamSocket:write(hs.json.encode({ action = "stop" }) .. "\n")
+      end)
+    end
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
       if pid ~= nil then
@@ -1760,8 +1865,9 @@ function M.start(options)
       end
     end
     if state.usingStream then
+      polishWithFlash(gen)
       hs.timer.doAfter(STREAM_TIMEOUT, function()
-        if state.generation == gen and (state.stopping or state.ui.visible) then
+        if state.generation == gen and not state.finished then
           dbg("stream stop_timeout")
           killStream()
           finishSession()
@@ -1969,6 +2075,7 @@ function M.start(options)
   state.debugLogPath = DEBUG_LOG
   dbg("lexicon ready path=%s hotwords=%d replacements=%d",
     tostring(state.lexiconPath), #state.hotwords, countPairs(state.replacements))
+  ensureDaemon()
   return state
 end
 

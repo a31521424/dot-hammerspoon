@@ -18,12 +18,19 @@ import websockets
 
 DEFAULT_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 DEFAULT_RESOURCE = "volc.seedasr.sauc.duration"
-PACKET_BYTES = 16000 * 2 * 1 * 200 // 1000  # 200 ms PCM
+PACKET_BYTES = 16000 * 2 * 1 * 100 // 1000  # 100 ms PCM (3200 bytes)
 
 
 def emit(event: dict) -> None:
     sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+async def emit_event(emitter, event: dict) -> None:
+    if asyncio.iscoroutinefunction(emitter):
+        await emitter(event)
+    else:
+        emitter(event)
 
 
 def log(message: str) -> None:
@@ -304,18 +311,15 @@ async def pump_audio(ws, folder: Path, stop_file: Path) -> None:
             del pending[:PACKET_BYTES]
             await ws.send(audio_request(chunk, last=False))
         if stopping:
-            settle_until = time.time() + 0.28
-            while time.time() < settle_until:
-                more = list_wavs(folder)
-                for path in more:
-                    key = str(path)
-                    if key in seen:
-                        continue
+            # One brief wait (at most 40ms) to ensure ffmpeg write buffer is flushed
+            await asyncio.sleep(0.04)
+            for path in list_wavs(folder):
+                key = str(path)
+                if key not in seen:
                     pcm = wav_pcm(path)
                     seen.add(key)
                     if len(pcm) >= 64:
                         pending.extend(pcm)
-                await asyncio.sleep(0.04)
             while len(pending) >= PACKET_BYTES:
                 chunk = bytes(pending[:PACKET_BYTES])
                 del pending[:PACKET_BYTES]
@@ -329,7 +333,14 @@ async def pump_audio(ws, folder: Path, stop_file: Path) -> None:
         await asyncio.sleep(0.04)
 
 
-async def run(folder: Path, url: str, resource: str, api_key: str, hotwords: list[dict] | None = None) -> int:
+async def run(
+    folder: Path,
+    url: str,
+    resource: str,
+    api_key: str,
+    hotwords: list[dict] | None = None,
+    emitter=emit,
+) -> int:
     request_id = str(uuid.uuid4())
     headers = {
         "X-Api-Key": api_key,
@@ -350,26 +361,26 @@ async def run(folder: Path, url: str, resource: str, api_key: str, hotwords: lis
             first = await asyncio.wait_for(ws.recv(), timeout=6)
             parsed = parse_frame(first if isinstance(first, (bytes, bytearray)) else first.encode())
             if parsed.get("kind") == "error":
-                emit({"event": "error", "message": parsed.get("message") or "stream error"})
+                await emit_event(emitter, {"event": "error", "message": parsed.get("message") or "stream error"})
                 return 2
-            emit({"event": "ready"})
+            await emit_event(emitter, {"event": "ready"})
             if parsed.get("text"):
                 latest = parsed["text"]
-                emit({"event": "partial", "text": latest})
+                await emit_event(emitter, {"event": "partial", "text": latest})
 
             async def reader() -> None:
                 nonlocal latest
                 async for message in ws:
                     frame = parse_frame(message if isinstance(message, (bytes, bytearray)) else message.encode())
                     if frame.get("kind") == "error":
-                        emit({"event": "error", "message": frame.get("message") or "stream error"})
+                        await emit_event(emitter, {"event": "error", "message": frame.get("message") or "stream error"})
                         return
                     text = frame.get("text") or ""
                     if text:
                         merged = collapse_repeats(merge_text(latest, text))
                         if merged != latest:
                             latest = merged
-                            emit({"event": "final" if frame.get("is_last") else "partial", "text": latest})
+                            await emit_event(emitter, {"event": "final" if frame.get("is_last") else "partial", "text": latest})
                     if frame.get("is_last"):
                         return
 
@@ -380,28 +391,118 @@ async def run(folder: Path, url: str, resource: str, api_key: str, hotwords: lis
             except asyncio.TimeoutError:
                 log("stream wait_final timeout")
             if latest:
-                emit({"event": "final", "text": latest})
-            emit({"event": "done"})
+                await emit_event(emitter, {"event": "final", "text": latest})
+            await emit_event(emitter, {"event": "done"})
             return 0
     except Exception as exc:
         text = str(exc)
         if "403" in text:
-            emit({"event": "error", "message": "403 Forbidden. Streaming ASR is not open for this key"})
+            await emit_event(emitter, {"event": "error", "message": "403 Forbidden. Streaming ASR is not open for this key"})
         elif "401" in text:
-            emit({"event": "error", "message": "401 Unauthorized. Check HAMMERSPOON_VOICE_DOUBAO_API_KEY"})
+            await emit_event(emitter, {"event": "error", "message": "401 Unauthorized. Check HAMMERSPOON_VOICE_DOUBAO_API_KEY"})
         else:
-            emit({"event": "error", "message": text[:240]})
+            await emit_event(emitter, {"event": "error", "message": text[:240]})
         return 2
+
+
+async def daemon_client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        raw_line = await reader.readline()
+        if not raw_line:
+            return
+        cmd = json.loads(raw_line.decode("utf-8"))
+        action = cmd.get("action")
+        if action != "start":
+            return
+        folder = Path(cmd["dir"])
+        folder.mkdir(parents=True, exist_ok=True)
+        url = cmd.get("url") or DEFAULT_URL
+        resource = cmd.get("resource") or DEFAULT_RESOURCE
+        api_key = cmd.get("api_key") or os.environ.get("HAMMERSPOON_VOICE_DOUBAO_API_KEY", "")
+        raw_hotwords = cmd.get("hotwords")
+        hotwords = None
+        if isinstance(raw_hotwords, list):
+            hotwords = []
+            for item in raw_hotwords:
+                if isinstance(item, str) and item.strip():
+                    hotwords.append({"word": item.strip()})
+                elif isinstance(item, dict) and item.get("word"):
+                    hotwords.append({"word": str(item["word"]).strip()})
+
+        async def socket_emit(event: dict) -> None:
+            data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            writer.write(data)
+            await writer.drain()
+
+        async def stop_listener() -> None:
+            try:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    data = json.loads(line.decode("utf-8"))
+                    if data.get("action") == "stop":
+                        (folder / "STOP").touch(exist_ok=True)
+                        break
+            except Exception:
+                pass
+
+        stop_task = asyncio.create_task(stop_listener())
+        try:
+            await run(folder, url, resource, api_key, hotwords, emitter=socket_emit)
+        finally:
+            stop_task.cancel()
+    except Exception as exc:
+        try:
+            err_data = (json.dumps({"event": "error", "message": str(exc)[:240]}, ensure_ascii=False) + "\n").encode("utf-8")
+            writer.write(err_data)
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def run_daemon(socket_path: Path) -> int:
+    if socket_path.exists():
+        try:
+            socket_path.unlink()
+        except Exception:
+            pass
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    server = await asyncio.start_unix_server(daemon_client_handler, path=str(socket_path))
+    try:
+        os.chmod(str(socket_path), 0o600)
+    except Exception:
+        pass
+    emit({"event": "daemon_ready", "socket": str(socket_path)})
+    async with server:
+        await server.serve_forever()
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", required=True)
+    parser.add_argument("--daemon", action="store_true", help="Run as persistent daemon listening on unix socket")
+    parser.add_argument("--socket", default="/tmp/hammerspoon_voice_stream.sock", help="Unix socket path for daemon mode")
+    parser.add_argument("--dir")
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--resource", default=DEFAULT_RESOURCE)
     parser.add_argument("--key-file")
     parser.add_argument("--hotwords-file")
     args = parser.parse_args()
+
+    if args.daemon:
+        return asyncio.run(run_daemon(Path(args.socket)))
+
+    if not args.dir:
+        emit({"event": "error", "message": "--dir is required when not running in daemon mode"})
+        return 2
+
     api_key = os.environ.get("HAMMERSPOON_VOICE_DOUBAO_API_KEY", "")
     if args.key_file and os.path.isfile(args.key_file):
         api_key = Path(args.key_file).read_text(encoding="utf-8").strip() or api_key
