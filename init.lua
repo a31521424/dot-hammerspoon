@@ -70,3 +70,17 @@ WindowSwitcher = require("window_switcher").start({
     },
   },
 })
+
+-- Voice input: hold Option + W to transcribe, release to stop.
+-- A preview shows the full transcript; the complete text is pasted
+-- at the caret after recognition finishes. Keep the API key out of
+-- this repository; use voice_input_secret.lua or
+-- HAMMERSPOON_VOICE_DOUBAO_API_KEY.
+local voiceSecret = {}
+pcall(function()
+  voiceSecret = require("voice_input_secret") or {}
+end)
+VoiceInput = require("voice_input").start({
+  apiKey = voiceSecret.apiKey or os.getenv("HAMMERSPOON_VOICE_DOUBAO_API_KEY"),
+  resourceID = "volc.seedasr.auc",
+})
