@@ -42,7 +42,47 @@ def header(message_type: int, flags: int = 0, serial: int = 1, compression: int 
     )
 
 
-def full_client_request() -> bytes:
+def load_hotwords(path: Path | None) -> list[dict]:
+    if path is not None and path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            items = raw.get("hotwords") if isinstance(raw, dict) else raw
+            words = []
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, str) and item.strip():
+                        words.append({"word": item.strip()})
+                    elif isinstance(item, dict):
+                        word = item.get("word")
+                        if isinstance(word, str) and word.strip():
+                            words.append({"word": word.strip()})
+            if words:
+                return words
+        except Exception:
+            pass
+    return []
+
+
+def full_client_request(hotwords: list[dict] | None = None) -> bytes:
+    words = hotwords or []
+    request = {
+        "model_name": "bigmodel",
+        "enable_itn": True,
+        "enable_punc": True,
+        "enable_ddc": True,
+        "enable_nonstream": True,
+        "show_utterances": True,
+        "result_type": "full",
+        "end_window_size": 800,
+    }
+    if words:
+        request["corpus"] = {
+            "context": json.dumps(
+                {"hotwords": words},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        }
     payload = {
         "user": {"uid": "hammerspoon-voice-input"},
         "audio": {
@@ -52,31 +92,7 @@ def full_client_request() -> bytes:
             "bits": 16,
             "channel": 1,
         },
-        "request": {
-            "model_name": "bigmodel",
-            "enable_itn": True,
-            "enable_punc": True,
-            "enable_ddc": True,
-            "enable_nonstream": True,
-            "show_utterances": True,
-            "result_type": "full",
-            "end_window_size": 800,
-            "corpus": {
-                "context": json.dumps(
-                    {
-                        "hotwords": [
-                            {"word": "流式"},
-                            {"word": "流式输入"},
-                            {"word": "转录"},
-                            {"word": "准确率"},
-                            {"word": "Hammerspoon"},
-                        ]
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            },
-        },
+        "request": request,
     }
     compressed = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return header(1, 0, 1, 1) + struct.pack(">I", len(compressed)) + compressed
@@ -313,7 +329,7 @@ async def pump_audio(ws, folder: Path, stop_file: Path) -> None:
         await asyncio.sleep(0.04)
 
 
-async def run(folder: Path, url: str, resource: str, api_key: str) -> int:
+async def run(folder: Path, url: str, resource: str, api_key: str, hotwords: list[dict] | None = None) -> int:
     request_id = str(uuid.uuid4())
     headers = {
         "X-Api-Key": api_key,
@@ -330,7 +346,7 @@ async def run(folder: Path, url: str, resource: str, api_key: str) -> int:
             close_timeout=3,
             max_size=2**22,
         ) as ws:
-            await ws.send(full_client_request())
+            await ws.send(full_client_request(hotwords))
             first = await asyncio.wait_for(ws.recv(), timeout=6)
             parsed = parse_frame(first if isinstance(first, (bytes, bytearray)) else first.encode())
             if parsed.get("kind") == "error":
@@ -384,6 +400,7 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--resource", default=DEFAULT_RESOURCE)
     parser.add_argument("--key-file")
+    parser.add_argument("--hotwords-file")
     args = parser.parse_args()
     api_key = os.environ.get("HAMMERSPOON_VOICE_DOUBAO_API_KEY", "")
     if args.key_file and os.path.isfile(args.key_file):
@@ -393,7 +410,8 @@ def main() -> int:
         return 2
     folder = Path(args.dir)
     folder.mkdir(parents=True, exist_ok=True)
-    return asyncio.run(run(folder, args.url, args.resource, api_key))
+    hotwords = load_hotwords(Path(args.hotwords_file) if args.hotwords_file else None)
+    return asyncio.run(run(folder, args.url, args.resource, api_key, hotwords))
 
 
 if __name__ == "__main__":

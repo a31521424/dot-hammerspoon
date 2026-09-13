@@ -7,6 +7,9 @@
 -- preview closes and the complete text is pasted at the caret.
 -- System output is muted while listening so speaker audio is not
 -- captured again by the microphone.
+-- Customize recall words in ~/.hammerspoon/voice_hotwords.lua
+-- (copy from voice_hotwords.lua.example). That file is local and
+-- is not part of the project defaults.
 local M = {}
 
 local log = hs.logger.new("voice-input", "debug")
@@ -55,6 +58,169 @@ local function joinTranscript(left, right)
     end
   end
   return left .. right
+end
+
+local function addHotword(words, seen, word)
+  if type(word) == "table" then
+    word = word.word
+  end
+  if type(word) ~= "string" then
+    return
+  end
+  word = word:gsub("^%s+", ""):gsub("%s+$", "")
+  if word == "" or seen[word] then
+    return
+  end
+  seen[word] = true
+  words[#words + 1] = word
+end
+
+local function mergeHotwords(...)
+  local words = {}
+  local seen = {}
+  for index = 1, select("#", ...) do
+    local list = select(index, ...)
+    if type(list) == "table" then
+      for _, word in ipairs(list) do
+        addHotword(words, seen, word)
+      end
+    end
+  end
+  return words
+end
+
+local function mergeReplacements(...)
+  local merged = {}
+  for index = 1, select("#", ...) do
+    local list = select(index, ...)
+    if type(list) == "table" then
+      for from, to in pairs(list) do
+        if type(from) == "string" and type(to) == "string" and from ~= "" then
+          merged[from] = to
+        end
+      end
+    end
+  end
+  return merged
+end
+
+local function configDir()
+  return hs.configdir or ((os.getenv("HOME") or "") .. "/.hammerspoon")
+end
+
+local function defaultLexiconPath()
+  return configDir() .. "/voice_hotwords.lua"
+end
+
+local function copyFile(src, dst)
+  local input = io.open(src, "r")
+  if input == nil then
+    return false
+  end
+  local output = io.open(dst, "w")
+  if output == nil then
+    input:close()
+    return false
+  end
+  output:write(input:read("*a") or "")
+  input:close()
+  output:close()
+  return true
+end
+
+local function ensureLexiconFile(path)
+  if path == nil or path == "" then
+    return nil
+  end
+  if hs.fs.attributes(path, "mode") == "file" then
+    return path
+  end
+  local example = configDir() .. "/voice_hotwords.lua.example"
+  if hs.fs.attributes(example, "mode") == "file" and copyFile(example, path) then
+    return path
+  end
+  local handle = io.open(path, "w")
+  if handle == nil then
+    return path
+  end
+  handle:write("return {\n  hotwords = {},\n  replacements = {},\n}\n")
+  handle:close()
+  return path
+end
+
+local function loadLexicon(path)
+  local empty = { hotwords = {}, replacements = {} }
+  if path == nil or hs.fs.attributes(path, "mode") ~= "file" then
+    return empty
+  end
+  local chunk, err = loadfile(path)
+  if chunk == nil then
+    log.w("lexicon load_error path=" .. tostring(path) .. " err=" .. tostring(err))
+    return empty
+  end
+  local ok, data = pcall(chunk)
+  if not ok or type(data) ~= "table" then
+    log.w("lexicon exec_error path=" .. tostring(path) .. " err=" .. tostring(data))
+    return empty
+  end
+  return data
+end
+
+local function countPairs(map)
+  local count = 0
+  if type(map) ~= "table" then
+    return 0
+  end
+  for _ in pairs(map) do
+    count = count + 1
+  end
+  return count
+end
+
+local function replacePlain(text, from, to)
+  local out = {}
+  local pos = 1
+  while true do
+    local startAt, endAt = text:find(from, pos, true)
+    if startAt == nil then
+      out[#out + 1] = text:sub(pos)
+      break
+    end
+    out[#out + 1] = text:sub(pos, startAt - 1)
+    out[#out + 1] = to
+    pos = endAt + 1
+  end
+  return table.concat(out)
+end
+
+local function applyReplacements(text, replacements)
+  if type(text) ~= "string" or text == "" or type(replacements) ~= "table" then
+    return text
+  end
+  local keys = {}
+  for from, to in pairs(replacements) do
+    if type(from) == "string" and from ~= "" and type(to) == "string" then
+      keys[#keys + 1] = from
+    end
+  end
+  table.sort(keys, function(a, b)
+    return #a > #b
+  end)
+  for _, from in ipairs(keys) do
+    text = replacePlain(text, from, replacements[from])
+  end
+  return text
+end
+
+local function corpusContext(hotwords)
+  if type(hotwords) ~= "table" or #hotwords == 0 then
+    return nil
+  end
+  local items = {}
+  for _, word in ipairs(hotwords) do
+    items[#items + 1] = { word = word }
+  end
+  return hs.json.encode({ hotwords = items })
 end
 
 local function collapseRunawayRepeat(text)
@@ -727,7 +893,22 @@ local function afterModifiersClear(callback)
   check()
 end
 
-local function requestBody(wavBytes)
+local function requestBody(wavBytes, hotwords)
+  local request = {
+    model_name = "bigmodel",
+    enable_itn = true,
+    enable_punc = true,
+    enable_ddc = false,
+    enable_speaker_info = false,
+    enable_channel_split = false,
+    show_utterances = false,
+    vad_segment = false,
+    sensitive_words_filter = "",
+  }
+  local context = corpusContext(hotwords)
+  if context ~= nil then
+    request.corpus = { context = context }
+  end
   return hs.json.encode({
     user = { uid = "hammerspoon-voice-input" },
     audio = {
@@ -738,17 +919,7 @@ local function requestBody(wavBytes)
       bits = 16,
       channel = CHANNELS,
     },
-    request = {
-      model_name = "bigmodel",
-      enable_itn = true,
-      enable_punc = true,
-      enable_ddc = false,
-      enable_speaker_info = false,
-      enable_channel_split = false,
-      show_utterances = false,
-      vad_segment = false,
-      sensitive_words_filter = "",
-    },
+    request = request,
   })
 end
 
@@ -759,7 +930,7 @@ local function recognizeFlash(options, wavBytes, callback)
   local requestID = hs.host.uuid()
   local started = hs.timer.secondsSinceEpoch()
 
-  hs.http.asyncPost(flashURL, requestBody(wavBytes), {
+  hs.http.asyncPost(flashURL, requestBody(wavBytes, options.hotwords), {
     ["Content-Type"] = "application/json",
     ["X-Api-Key"] = apiKey,
     ["X-Api-Resource-Id"] = resourceID,
@@ -814,7 +985,7 @@ local function recognizeWav(options, wavBytes, callback)
     return headers
   end
 
-  hs.http.asyncPost(submitURL, requestBody(wavBytes), {
+  hs.http.asyncPost(submitURL, requestBody(wavBytes, options.hotwords), {
     ["Content-Type"] = "application/json",
     ["X-Api-Key"] = apiKey,
     ["X-Api-Resource-Id"] = resourceID,
@@ -870,6 +1041,9 @@ end
 
 function M.start(options)
   options = options or {}
+  local lexiconPath = options.hotwordsPath or defaultLexiconPath()
+  ensureLexiconFile(lexiconPath)
+  local lexicon = loadLexicon(lexiconPath)
   local state = {
     generation = 0,
     active = false,
@@ -886,6 +1060,9 @@ function M.start(options)
     queryURL = options.queryURL or DEFAULT_QUERY_URL,
     streamURL = options.streamURL or DEFAULT_STREAM_URL,
     streamResourceID = options.streamResourceID or DEFAULT_STREAM_RESOURCE_ID,
+    lexiconPath = lexiconPath,
+    hotwords = mergeHotwords(lexicon.hotwords, options.hotwords),
+    replacements = mergeReplacements(lexicon.replacements, options.replacements),
     streamPython = executable({
       (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/.venv/bin/python",
     }),
@@ -1086,6 +1263,11 @@ function M.start(options)
     if text == nil or text == "" then
       return
     end
+    local corrected = applyReplacements(text, state.replacements)
+    if corrected ~= text then
+      dbg("replace preview_from=%s preview_to=%s", previewText(text), previewText(corrected))
+      text = corrected
+    end
     text = collapseRunawayRepeat(text)
     if text == state.utteranceCommitted then
       return
@@ -1218,6 +1400,7 @@ function M.start(options)
       apiKey = state.apiKey,
       resourceID = state.resourceID,
       flashURL = state.flashURL,
+      hotwords = state.hotwords,
     }, pcmToWav(pcm), function(err, text)
       if state.generation ~= gen or state.finished then
         return
@@ -1278,6 +1461,7 @@ function M.start(options)
       apiKey = state.apiKey,
       resourceID = state.resourceID,
       flashURL = state.flashURL,
+      hotwords = state.hotwords,
     }, pcmToWav(pcm), function(err, text)
       if state.generation ~= gen then
         if captureDir ~= nil and captureDir ~= state.segmentDir then
@@ -1439,12 +1623,23 @@ function M.start(options)
       keyHandle:write(state.apiKey)
       keyHandle:close()
     end
+    local hotFile = state.segmentDir .. "/.hotwords.json"
+    local hotHandle = io.open(hotFile, "w")
+    if hotHandle ~= nil then
+      local items = {}
+      for _, word in ipairs(state.hotwords) do
+        items[#items + 1] = { word = word }
+      end
+      hotHandle:write(hs.json.encode({ hotwords = items }))
+      hotHandle:close()
+    end
     local args = {
       state.streamScript,
       "--dir", state.segmentDir,
       "--url", state.streamURL,
       "--resource", state.streamResourceID,
       "--key-file", keyFile,
+      "--hotwords-file", hotFile,
     }
     state.streamTask = hs.task.new(state.streamPython, function(code, stdout, stderr)
       if state.generation ~= gen then
@@ -1682,7 +1877,9 @@ function M.start(options)
       fail("Could not start microphone capture")
       return
     end
-    dbg("start gen=%d device=%s", state.generation, tostring(state.captureDevice))
+    dbg("start gen=%d device=%s lexicon=%s hotwords=%d replacements=%d",
+      state.generation, tostring(state.captureDevice), tostring(state.lexiconPath),
+      #state.hotwords, countPairs(state.replacements))
 
     state.levelTimer = hs.timer.doEvery(0.04, function()
       if state.failed or (not state.active and not state.stopping) then
@@ -1763,12 +1960,15 @@ function M.start(options)
       apiKey = state.apiKey,
       resourceID = state.resourceID,
       flashURL = state.flashURL,
+      hotwords = state.hotwords,
     }, wavBytes, callback)
   end
   state.isActive = function()
     return state.active
   end
   state.debugLogPath = DEBUG_LOG
+  dbg("lexicon ready path=%s hotwords=%d replacements=%d",
+    tostring(state.lexiconPath), #state.hotwords, countPairs(state.replacements))
   return state
 end
 

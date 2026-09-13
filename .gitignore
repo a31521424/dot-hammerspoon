@@ -1,4 +1,5 @@
 voice_input_secret.lua
+voice_hotwords.lua
 voice_input_debug.log
 .DS_Store
 .venv/

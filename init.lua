@@ -76,6 +76,8 @@ WindowSwitcher = require("window_switcher").start({
 -- at the caret after recognition finishes. Keep the API key out of
 -- this repository; use voice_input_secret.lua or
 -- HAMMERSPOON_VOICE_DOUBAO_API_KEY.
+-- Recall words live in ~/.hammerspoon/voice_hotwords.lua
+-- (copy from voice_hotwords.lua.example). Reload Hammerspoon after edits.
 local voiceSecret = {}
 pcall(function()
   voiceSecret = require("voice_input_secret") or {}

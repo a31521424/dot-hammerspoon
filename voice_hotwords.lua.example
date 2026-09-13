@@ -1,0 +1,26 @@
+-- Copy this file to voice_hotwords.lua and edit your own list.
+-- voice_hotwords.lua is ignored by Git and is not part of the project.
+--
+-- Path: ~/.hammerspoon/voice_hotwords.lua
+-- After editing, reload Hammerspoon (Reload Config).
+--
+-- hotwords: sent to streaming ASR and the final Flash pass.
+--   Streaming allows about 100 tokens. Keep phrases short.
+--   Do not add single characters or very common spoken words.
+-- replacements: local fix after recognition when a hotword still misses.
+
+return {
+  hotwords = {
+    "工作区",
+    "流式",
+    "流式输入",
+    "转录",
+    "准确率",
+    "Hammerspoon",
+    "backlog",
+    "commit",
+  },
+  replacements = {
+    ["工作去"] = "工作区",
+  },
+}
