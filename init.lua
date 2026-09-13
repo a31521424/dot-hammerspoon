@@ -83,4 +83,5 @@ end)
 VoiceInput = require("voice_input").start({
   apiKey = voiceSecret.apiKey or os.getenv("HAMMERSPOON_VOICE_DOUBAO_API_KEY"),
   resourceID = "volc.seedasr.auc",
+  streamResourceID = "volc.seedasr.sauc.duration",
 })

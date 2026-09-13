@@ -1,9 +1,10 @@
 -- Hold-to-talk voice input for Hammerspoon.
 --
--- Hold Option + W to listen. A preview card shows the full transcript
--- and can be rewritten as recognition revises earlier words. Releasing
--- the key stops recording; after leftover API calls finish, the preview
--- closes and the complete text is pasted at the caret.
+-- Hold Option + W to listen. Live text comes from Doubao streaming
+-- ASR (SAUC) when that product is open; file Flash is the fallback.
+-- A preview card shows the full transcript. Releasing the key stops
+-- recording; after the stream (or leftover Flash) finishes, the
+-- preview closes and the complete text is pasted at the caret.
 local M = {}
 
 local log = hs.logger.new("voice-input", "debug")
@@ -12,12 +13,54 @@ local DEBUG = true
 local DEBUG_LOG = (hs.configdir or os.getenv("HOME") .. "/.hammerspoon")
   .. "/voice_input_debug.log"
 
+local function utf8Chars(text)
+  local chars = {}
+  if text == nil or text == "" then
+    return chars
+  end
+  if utf8 ~= nil and utf8.codes ~= nil then
+    for _, code in utf8.codes(text) do
+      chars[#chars + 1] = utf8.char(code)
+    end
+    return chars
+  end
+  for index = 1, #text do
+    chars[index] = text:sub(index, index)
+  end
+  return chars
+end
+
+local function joinTranscript(left, right)
+  if left == nil or left == "" then
+    return right or ""
+  end
+  if right == nil or right == "" then
+    return left
+  end
+  local leftChars = utf8Chars(left)
+  local rightChars = utf8Chars(right)
+  local max = math.min(#leftChars, #rightChars, 12)
+  for count = max, 1, -1 do
+    local matched = true
+    for index = 1, count do
+      if leftChars[#leftChars - count + index] ~= rightChars[index] then
+        matched = false
+        break
+      end
+    end
+    if matched then
+      return left .. table.concat(rightChars, "", count + 1)
+    end
+  end
+  return left .. right
+end
+
 local function previewText(text)
   if text == nil or text == "" then
     return ""
   end
-  if #text > 36 then
-    return text:sub(1, 36) .. "…"
+  if #text > 72 then
+    return text:sub(1, 72) .. "…"
   end
   return text
 end
@@ -51,14 +94,19 @@ local SAMPLE_RATE = 16000
 local CHANNELS = 1
 local BYTES_PER_SAMPLE = 2
 local BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
-local MIN_PCM_BYTES = BYTES_PER_SECOND * 0.4
+local MIN_PCM_BYTES = BYTES_PER_SECOND * 0.28
+local NEW_AUDIO_BYTES = BYTES_PER_SECOND * 0.15
 local SEGMENT_SECONDS = 0.1
-local LIVE_INTERVAL = 0.5
-local FORCE_WINDOW_SECONDS = 20
-local SILENCE_WINDOW_SECONDS = 3.2
-local SILENCE_TAIL_SECONDS = 0.35
+local LIVE_INTERVAL = 0.35
+local FIRST_TICK_SECONDS = 0.28
+local FORCE_WINDOW_SECONDS = 3.0
+local SILENCE_WINDOW_SECONDS = 1.0
+local SILENCE_TAIL_SECONDS = 0.25
+local OVERLAP_SECONDS = 0.3
 local SILENCE_LEVEL = 0.07
-local FLIGHT_TIMEOUT = 7
+local FLIGHT_TIMEOUT = 5
+local FINALIZE_DELAY = 0.12
+local REUSE_TAIL_SECONDS = 0.28
 local QUERY_INTERVAL = 0.8
 local QUERY_TIMEOUT = 45
 local MAX_RECORD_SECONDS = 120
@@ -67,6 +115,9 @@ local DEFAULT_FLASH_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/
 local DEFAULT_SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
 local DEFAULT_QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
 local DEFAULT_RESOURCE_ID = "volc.seedasr.auc"
+local DEFAULT_STREAM_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+local DEFAULT_STREAM_RESOURCE_ID = "volc.seedasr.sauc.duration"
+local STREAM_TIMEOUT = 10
 
 local function listAudioDevices(ffmpeg)
   local command = string.format(
@@ -682,6 +733,7 @@ local function recognizeFlash(options, wavBytes, callback)
   local resourceID = options.resourceID or DEFAULT_RESOURCE_ID
   local flashURL = options.flashURL or DEFAULT_FLASH_URL
   local requestID = hs.host.uuid()
+  local started = hs.timer.secondsSinceEpoch()
 
   hs.http.asyncPost(flashURL, requestBody(wavBytes), {
     ["Content-Type"] = "application/json",
@@ -690,25 +742,30 @@ local function recognizeFlash(options, wavBytes, callback)
     ["X-Api-Request-Id"] = requestID,
     ["X-Api-Sequence"] = "-1",
   }, function(status, body, headers)
+    local duration = hs.timer.secondsSinceEpoch() - started
     if status < 0 then
-      dbg("flash transport_error status=%s body=%s", tostring(status), tostring(body))
+      dbg("flash transport_error dur=%.3f bytes=%d status=%s body=%s",
+        duration, #wavBytes, tostring(status), tostring(body))
       callback(body or "recognize failed", nil)
       return
     end
     local code = headerValue(headers, "X-Api-Status-Code")
     local message = headerValue(headers, "X-Api-Message")
     if code == "20000003" then
-      dbg("flash silence http=%s code=%s", tostring(status), tostring(code))
+      dbg("flash silence dur=%.3f bytes=%d http=%s code=%s",
+        duration, #wavBytes, tostring(status), tostring(code))
       callback(nil, "")
       return
     end
     if status ~= 200 or code ~= "20000000" then
-      dbg("flash error http=%s code=%s msg=%s", tostring(status), tostring(code), tostring(message))
+      dbg("flash error dur=%.3f bytes=%d http=%s code=%s msg=%s",
+        duration, #wavBytes, tostring(status), tostring(code), tostring(message))
       callback(describeStatus(code or status, message or body), nil)
       return
     end
     local text = findText(decodeJson(body)) or ""
-    dbg("flash ok http=%s text_len=%d preview=%s", tostring(status), #text, previewText(text))
+    dbg("flash ok dur=%.3f bytes=%d http=%s text_len=%d preview=%s",
+      duration, #wavBytes, tostring(status), #text, previewText(text))
     callback(nil, text)
   end)
 end
@@ -803,6 +860,12 @@ function M.start(options)
     flashURL = options.flashURL or DEFAULT_FLASH_URL,
     submitURL = options.submitURL or DEFAULT_SUBMIT_URL,
     queryURL = options.queryURL or DEFAULT_QUERY_URL,
+    streamURL = options.streamURL or DEFAULT_STREAM_URL,
+    streamResourceID = options.streamResourceID or DEFAULT_STREAM_RESOURCE_ID,
+    streamPython = executable({
+      (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/.venv/bin/python",
+    }),
+    streamScript = (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/voice_stream.py",
     ffmpeg = options.ffmpegPath or executable({ "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" }),
     audioDevice = options.audioDevice,
     audioTask = nil,
@@ -820,6 +883,13 @@ function M.start(options)
     level = 0,
     levelTimer = nil,
     liveTimer = nil,
+    streamTask = nil,
+    streamBuf = "",
+    usingStream = false,
+    streamReady = false,
+    streamDone = false,
+    polishing = false,
+    finished = false,
     ui = makeUI(),
   }
 
@@ -841,18 +911,39 @@ function M.start(options)
     state.ingested = {}
   end
 
+  local function killStream()
+    if state.streamTask ~= nil and state.streamTask:isRunning() then
+      state.streamTask:terminate()
+    end
+    state.streamTask = nil
+    state.streamBuf = ""
+  end
+
+  local function writeStopFile()
+    if state.segmentDir == nil then
+      return
+    end
+    local file = io.open(state.segmentDir .. "/STOP", "w")
+    if file ~= nil then
+      file:write("1")
+      file:close()
+    end
+  end
+
   local function fail(message)
     if state.failed then
       return
     end
     local showPreview = state.active or state.stopping or (state.ui ~= nil and state.ui.visible)
     state.failed = true
+    state.finished = true
     state.active = false
     state.stopping = false
     state.inFlight = false
     state.pendingFinal = false
     log.e(message)
     stopTimers()
+    killStream()
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
       if pid ~= nil then
@@ -878,7 +969,7 @@ function M.start(options)
   end
 
   local function sessionTranscript()
-    return state.sessionText .. state.utteranceCommitted
+    return joinTranscript(state.sessionText, state.utteranceCommitted)
   end
 
   local function refreshPreview()
@@ -932,7 +1023,7 @@ function M.start(options)
   local function rollWindow()
     local beforeStart = state.windowStart
     local beforeSubmitted = state.submittedBytes
-    state.sessionText = state.sessionText .. state.utteranceCommitted
+    state.sessionText = joinTranscript(state.sessionText, state.utteranceCommitted)
     state.utteranceCommitted = ""
     local recognized = state.windowStart + state.submittedBytes
     if recognized < state.windowStart then
@@ -941,11 +1032,19 @@ function M.start(options)
     if recognized > #state.pcmBuffer then
       recognized = #state.pcmBuffer
     end
-    state.windowStart = recognized
+    local keep = math.floor(OVERLAP_SECONDS * BYTES_PER_SECOND)
+    local nextStart = recognized - keep
+    if nextStart < beforeStart then
+      nextStart = beforeStart
+    end
+    if nextStart < 0 then
+      nextStart = 0
+    end
+    state.windowStart = nextStart
     state.submittedBytes = 0
     state.pendingRoll = false
-    dbg("roll start %d->%d submitted=%d pcm=%d session_len=%d",
-      beforeStart, state.windowStart, beforeSubmitted, #state.pcmBuffer, #state.sessionText)
+    dbg("roll start %d->%d submitted=%d pcm=%d session_len=%d keep=%d",
+      beforeStart, state.windowStart, beforeSubmitted, #state.pcmBuffer, #state.sessionText, keep)
   end
 
   local function shouldRoll(pcm)
@@ -959,8 +1058,12 @@ function M.start(options)
   end
 
   local function finishSession()
+    if state.finished then
+      return
+    end
     local gen = state.generation
     local text = sessionTranscript()
+    state.finished = true
     state.active = false
     state.stopping = false
     state.inFlight = false
@@ -971,6 +1074,7 @@ function M.start(options)
     if state.ui ~= nil then
       state.ui:hide()
     end
+    killStream()
     dbg("finish gen=%d text_len=%d preview=%s", gen, #text, previewText(text))
     if not state.autoPaste or text == "" then
       return
@@ -981,6 +1085,43 @@ function M.start(options)
       end
       dbg("insert caret text_len=%d preview=%s", #text, previewText(text))
       insertAtCaret(text)
+    end)
+  end
+
+  local function polishWithFlash(gen)
+    if state.finished or state.failed or state.generation ~= gen then
+      return
+    end
+    if state.polishing then
+      return
+    end
+    state.polishing = true
+    ingestSegments(true)
+    local pcm = state.pcmBuffer or ""
+    dbg("polish pcm=%d stream_len=%d", #pcm, #sessionTranscript())
+    if #pcm < MIN_PCM_BYTES then
+      finishSession()
+      return
+    end
+    if state.ui ~= nil then
+      state.ui:setStatus("正在校对")
+    end
+    recognizeFlash({
+      apiKey = state.apiKey,
+      resourceID = state.resourceID,
+      flashURL = state.flashURL,
+    }, pcmToWav(pcm), function(err, text)
+      if state.generation ~= gen or state.finished then
+        return
+      end
+      if text ~= nil and text ~= "" then
+        dbg("polish ok text_len=%d preview=%s", #text, previewText(text))
+        state.sessionText = ""
+        applyTranscript(text)
+      else
+        dbg("polish keep_stream err=%s", tostring(err))
+      end
+      finishSession()
     end)
   end
 
@@ -1023,7 +1164,8 @@ function M.start(options)
     local captureDir = state.segmentDir
     state.inFlight = true
     state.flightStarted = hs.timer.secondsSinceEpoch()
-    dbg("recognize send pcm=%d final=%s window_start=%d", #pcm, tostring(final), state.windowStart)
+    dbg("recognize send pcm=%d sec=%.2f final=%s window_start=%d",
+      #pcm, #pcm / BYTES_PER_SECOND, tostring(final), state.windowStart)
     recognizeFlash({
       apiKey = state.apiKey,
       resourceID = state.resourceID,
@@ -1065,7 +1207,11 @@ function M.start(options)
         state.pendingFinal = false
         ingestSegments(true)
         local latest = windowPcm()
-        if #latest > MIN_PCM_BYTES and #latest > state.submittedBytes then
+        local leftover = #latest - state.submittedBytes
+        if leftover < (REUSE_TAIL_SECONDS * BYTES_PER_SECOND) and sessionTranscript() ~= "" then
+          dbg("finalize reuse_preview leftover=%d", leftover)
+          finishSession()
+        elseif #latest > MIN_PCM_BYTES and leftover > 0 then
           recognizePcm(latest, true, gen)
         else
           finishSession()
@@ -1074,11 +1220,28 @@ function M.start(options)
       end
       if final then
         finishSession()
+        return
+      end
+      if state.stopping then
+        return
+      end
+      ingestSegments(false)
+      local nextPcm = windowPcm()
+      if shouldRoll(nextPcm) and state.utteranceCommitted ~= "" then
+        rollWindow()
+        nextPcm = windowPcm()
+      end
+      if #nextPcm >= MIN_PCM_BYTES and (#nextPcm - state.submittedBytes) >= NEW_AUDIO_BYTES then
+        dbg("recognize follow_up pcm=%d new=%d", #nextPcm, #nextPcm - state.submittedBytes)
+        recognizePcm(nextPcm, false, gen)
       end
     end)
   end
 
   local function liveTick()
+    if state.usingStream then
+      return
+    end
     if not state.active or state.failed or state.stopping then
       dbg("live skip active=%s failed=%s stopping=%s",
         tostring(state.active), tostring(state.failed), tostring(state.stopping))
@@ -1102,15 +1265,168 @@ function M.start(options)
     recognizePcm(pcm, false, state.generation)
   end
 
+  local function startFlashLive()
+    if state.liveTimer ~= nil or not state.active or state.failed then
+      return
+    end
+    dbg("flash fallback live")
+    state.usingStream = false
+    state.liveTimer = hs.timer.doEvery(LIVE_INTERVAL, liveTick)
+    hs.timer.doAfter(FIRST_TICK_SECONDS, liveTick)
+  end
+
+  local function handleStreamLine(line)
+    if line == nil or line == "" then
+      return
+    end
+    local ok, msg = pcall(hs.json.decode, line)
+    if not ok or type(msg) ~= "table" then
+      dbg("stream bad_line %s", previewText(line))
+      return
+    end
+    local event = msg.event
+    if event == "ready" then
+      state.streamReady = true
+      dbg("stream ready")
+      return
+    end
+    if event == "partial" or event == "final" then
+      if type(msg.text) == "string" and msg.text ~= "" then
+        state.sessionText = ""
+        applyTranscript(msg.text)
+      end
+      return
+    end
+    if event == "done" then
+      state.streamDone = true
+      dbg("stream done preview_len=%d", #sessionTranscript())
+      return
+    end
+    if event == "error" then
+      dbg("stream error %s", tostring(msg.message))
+      if sessionTranscript() == "" and state.active and not state.stopping then
+        killStream()
+        startFlashLive()
+        return
+      end
+      if sessionTranscript() == "" then
+        fail(msg.message or "Streaming ASR failed")
+      end
+    end
+  end
+
+  local function startStream(gen)
+    if state.streamPython == nil or hs.fs.attributes(state.streamScript, "mode") ~= "file" then
+      dbg("stream unavailable python=%s", tostring(state.streamPython))
+      startFlashLive()
+      return
+    end
+    state.usingStream = true
+    state.streamReady = false
+    state.streamDone = false
+    state.streamBuf = ""
+    local keyFile = state.segmentDir .. "/.apikey"
+    local keyHandle = io.open(keyFile, "w")
+    if keyHandle ~= nil then
+      keyHandle:write(state.apiKey)
+      keyHandle:close()
+    end
+    local args = {
+      state.streamScript,
+      "--dir", state.segmentDir,
+      "--url", state.streamURL,
+      "--resource", state.streamResourceID,
+      "--key-file", keyFile,
+    }
+    state.streamTask = hs.task.new(state.streamPython, function(code, stdout, stderr)
+      if state.generation ~= gen then
+        return
+      end
+      if stdout ~= nil and stdout ~= "" then
+        state.streamBuf = (state.streamBuf or "") .. stdout
+      end
+      if state.streamBuf ~= nil and state.streamBuf ~= "" then
+        for line in (state.streamBuf .. "\n"):gmatch("(.-)\n") do
+          handleStreamLine(line)
+        end
+        state.streamBuf = ""
+      end
+      if stderr ~= nil and stderr ~= "" then
+        dbg("stream exit_err %s", previewText(stderr))
+      end
+      dbg("stream exit code=%s ready=%s done=%s", tostring(code), tostring(state.streamReady), tostring(state.streamDone))
+      state.streamTask = nil
+      if state.failed then
+        return
+      end
+      if state.stopping or state.streamDone then
+        polishWithFlash(gen)
+        return
+      end
+      if sessionTranscript() == "" then
+        startFlashLive()
+      end
+    end, function(_, stdout, stderr)
+      if stderr ~= nil and stderr ~= "" then
+        for errLine in stderr:gmatch("[^\n]+") do
+          dbg("stream stderr %s", previewText(errLine))
+        end
+      end
+      if stdout ~= nil and stdout ~= "" then
+        state.streamBuf = state.streamBuf .. stdout
+        while true do
+          local pos = state.streamBuf:find("\n", 1, true)
+          if pos == nil then
+            break
+          end
+          local line = state.streamBuf:sub(1, pos - 1)
+          state.streamBuf = state.streamBuf:sub(pos + 1)
+          handleStreamLine(line)
+        end
+      end
+      return true
+    end, args)
+    if not state.streamTask:start() then
+      dbg("stream start_failed")
+      state.streamTask = nil
+      startFlashLive()
+      return
+    end
+    dbg("stream start gen=%d resource=%s", gen, state.streamResourceID)
+    hs.timer.doAfter(2.2, function()
+      if state.generation == gen and state.active and state.usingStream and not state.streamReady then
+        dbg("stream ready_timeout fallback_flash")
+        killStream()
+        startFlashLive()
+      end
+    end)
+  end
+
   local function finalize()
+    if state.usingStream then
+      dbg("finalize skip stream")
+      return
+    end
     if state.failed or state.finalStarted then
       dbg("finalize skip failed=%s started=%s", tostring(state.failed), tostring(state.finalStarted))
       return
     end
     state.finalStarted = true
     ingestSegments(true)
-    dbg("finalize pcm=%d", #windowPcm())
-    recognizePcm(windowPcm(), true, state.generation)
+    local pcm = windowPcm()
+    local leftover = #pcm - state.submittedBytes
+    dbg("finalize pcm=%d leftover=%d inflight=%s", #pcm, leftover, tostring(state.inFlight))
+    if state.inFlight then
+      state.pendingFinal = true
+      dbg("finalize wait_inflight leftover=%d", leftover)
+      return
+    end
+    if sessionTranscript() ~= "" and leftover < (REUSE_TAIL_SECONDS * BYTES_PER_SECOND) then
+      dbg("finalize reuse_preview leftover=%d", leftover)
+      finishSession()
+      return
+    end
+    recognizePcm(pcm, true, state.generation)
   end
 
   local function stop()
@@ -1130,6 +1446,7 @@ function M.start(options)
       state.ui:setStatus("正在完成识别")
       refreshPreview()
     end
+    writeStopFile()
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
       if pid ~= nil then
@@ -1138,7 +1455,17 @@ function M.start(options)
         state.audioTask:terminate()
       end
     end
-    hs.timer.doAfter(0.28, function()
+    if state.usingStream then
+      hs.timer.doAfter(STREAM_TIMEOUT, function()
+        if state.generation == gen and (state.stopping or state.ui.visible) then
+          dbg("stream stop_timeout")
+          killStream()
+          finishSession()
+        end
+      end)
+      return
+    end
+    hs.timer.doAfter(FINALIZE_DELAY, function()
       if state.generation == gen then
         finalize()
       end
@@ -1157,6 +1484,7 @@ function M.start(options)
       end
     end
     stopTimers()
+    killStream()
     local previousDir = state.segmentDir
     local previousInFlight = state.inFlight
     state.generation = state.generation + 1
@@ -1179,6 +1507,7 @@ function M.start(options)
     state.inFlight = false
     state.pendingFinal = false
     state.finalStarted = false
+    state.finished = false
     state.lastResult = ""
     state.sessionText = ""
     state.utteranceCommitted = ""
@@ -1188,6 +1517,11 @@ function M.start(options)
     state.submittedBytes = 0
     state.pendingRoll = false
     state.flightStarted = 0
+    state.usingStream = false
+    state.streamReady = false
+    state.streamDone = false
+    state.polishing = false
+    state.streamBuf = ""
     state.segmentDir = tempSegmentDir()
     state.audioError = ""
     state.level = 0
@@ -1263,8 +1597,7 @@ function M.start(options)
       state.ui:setLevel(state.level)
     end)
 
-    state.liveTimer = hs.timer.doEvery(LIVE_INTERVAL, liveTick)
-    hs.timer.doAfter(0.45, liveTick)
+    startStream(state.generation)
   end
 
   -- Option + W is a real USB combo on 68-key boards. Eating the
