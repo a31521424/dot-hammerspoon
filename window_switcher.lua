@@ -90,7 +90,7 @@ local function titleIsIgnored(title, appName, bundleID, titlePatterns)
     or (bundleID ~= nil and matchesAny(title, titlePatterns[bundleID]))
 end
 
-local function makeWindowPredicate(config, ignored, baseFilter)
+local function makeWindowPredicate(config, ignored)
   local allowedSubroles = copyMap(config.allowedSubroles or DEFAULT_ALLOWED_SUBROLES)
 
   return function(window)
@@ -106,7 +106,10 @@ local function makeWindowPredicate(config, ignored, baseFilter)
 
       local appName = application:name()
       local bundleID = application:bundleID()
-      if appName == nil or not baseFilter:isAppAllowed(appName) then
+      if appName == nil or not hs.window.filter.isGuiApp(appName) then
+        return false
+      end
+      if hs.window.filter.ignoreInDefaultFilter[appName] then
         return false
       end
 
@@ -121,13 +124,15 @@ local function makeWindowPredicate(config, ignored, baseFilter)
       end
 
       local hidden = application:isHidden()
-      local minimized = window:isMinimized()
       if hidden and not config.includeHidden then
         return false
       end
+
+      local minimized = window:isMinimized()
       if minimized and not config.includeMinimized then
         return false
       end
+
       if not hidden and not minimized and not window:isVisible() then
         return false
       end
@@ -369,13 +374,13 @@ function M.start(options)
   }
   local ignored = normalizeIgnored(options.ignored)
 
-  local baseFilter = hs.window.filter.new()
   local windowFilter = hs.window.filter.new(
-    makeWindowPredicate(config, ignored, baseFilter),
+    makeWindowPredicate(config, ignored),
     "alt-tab-filter",
     "warning"
   )
   windowFilter:setSortOrder(hs.window.filter.sortByFocusedLast)
+  windowFilter:keepActive()
 
   local switcher = hs.window.switcher.new(
     windowFilter,
@@ -384,42 +389,68 @@ function M.start(options)
     "warning"
   )
   local layoutRepairTimer = nil
+  local lastFocusTime = 0
+
+  windowFilter:subscribe(hs.window.filter.windowFocused, function()
+    lastFocusTime = hs.timer.secondsSinceEpoch()
+  end)
 
   local function prepareListLayout(wasFresh)
+    if not wasFresh then
+      return
+    end
+
     layoutSwitcherAsList(switcher)
     attachClickCallbacks(switcher)
 
     -- On the first invocation the native switcher fills in title text after
     -- its 150 ms display delay and briefly reapplies horizontal assumptions.
     -- Restore only the drawing frames afterwards; no input state is involved.
-    if wasFresh then
-      local activeWindows = switcher.windows
-      if layoutRepairTimer ~= nil then
-        layoutRepairTimer:stop()
-      end
-      layoutRepairTimer = hs.timer.doAfter(0.16, function()
-        layoutRepairTimer = nil
-        if switcher.windows == activeWindows then
-          layoutSwitcherAsList(switcher)
-        end
-      end)
+    local activeWindows = switcher.windows
+    if layoutRepairTimer ~= nil then
+      layoutRepairTimer:stop()
     end
+    layoutRepairTimer = hs.timer.doAfter(0.16, function()
+      layoutRepairTimer = nil
+      if switcher.windows == activeWindows then
+        layoutSwitcherAsList(switcher)
+      end
+    end)
+  end
+
+  local function isStaleQueuedActivation()
+    local now = hs.timer.secondsSinceEpoch()
+    -- If a window was just focused within 250ms and user is not holding Alt,
+    -- this is a stale buffered event from event queue backlog.
+    if (now - lastFocusTime) < 0.25 then
+      local mods = hs.eventtap.checkKeyboardModifiers(true)
+      if mods == nil or not mods.alt then
+        return true
+      end
+    end
+    return false
   end
 
   local function nextWindow()
     local wasFresh = switcher.windows == nil
+    if wasFresh and isStaleQueuedActivation() then
+      return
+    end
     switcher:next()
     prepareListLayout(wasFresh)
   end
 
   local function previousWindow()
     local wasFresh = switcher.windows == nil
+    if wasFresh and isStaleQueuedActivation() then
+      return
+    end
     switcher:previous()
     prepareListLayout(wasFresh)
   end
 
   local controller = {
-    baseFilter = baseFilter,
+    baseFilter = windowFilter,
     windowFilter = windowFilter,
     switcher = switcher,
     hotkeys = {
@@ -433,36 +464,42 @@ function M.start(options)
     },
   }
 
-  function controller:candidateCount()
-    return #self.windowFilter:getWindows()
+  function controller.candidateCount(self)
+    local filter = (type(self) == "table" and self.windowFilter) or windowFilter
+    return #filter:getWindows()
   end
 
-  function controller:next()
+  function controller.next()
     nextWindow()
   end
 
-  function controller:previous()
+  function controller.previous()
     previousWindow()
   end
 
-  function controller:clickIndex(index)
-    clickWindow(self.switcher, index)
+  function controller.clickIndex(self, index)
+    local actualIndex = index or self
+    clickWindow(switcher, actualIndex)
   end
 
-  function controller:cancel()
-    dismissWithoutFocus(self.switcher)
+  function controller.cancel()
+    dismissWithoutFocus(switcher)
   end
 
-  function controller:stop()
-    dismissWithoutFocus(self.switcher)
+  function controller.stop(self)
+    dismissWithoutFocus(switcher)
     if layoutRepairTimer ~= nil then
       layoutRepairTimer:stop()
       layoutRepairTimer = nil
     end
-    for _, hotkey in pairs(self.hotkeys) do
+    local target = (type(self) == "table" and self) or controller
+    for _, hotkey in pairs(target.hotkeys or {}) do
       hotkey:delete()
     end
-    self.hotkeys = {}
+    target.hotkeys = {}
+    if windowFilter ~= nil then
+      windowFilter:pause()
+    end
   end
 
   return controller

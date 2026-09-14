@@ -2,7 +2,8 @@
 -- another Dock icon.
 hs.dockicon.hide()
 
--- Enable the local `hs` command for health checks and troubleshooting.
+-- Enable AppleScript and local IPC for health checks and troubleshooting.
+hs.allowAppleScript(true)
 require("hs.ipc")
 
 -- Keep this global so Hammerspoon does not garbage-collect the switcher,
