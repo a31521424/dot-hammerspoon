@@ -320,6 +320,7 @@ local function clickWindow(switcher, index)
   dismissWithoutFocus(switcher)
   local ok, err = pcall(function()
     target:unminimize()
+    target:raise()
     target:focus()
   end)
   if not ok then
@@ -374,13 +375,52 @@ function M.start(options)
   }
   local ignored = normalizeIgnored(options.ignored)
 
+  local predicate = makeWindowPredicate(config, ignored)
   local windowFilter = hs.window.filter.new(
-    makeWindowPredicate(config, ignored),
+    predicate,
     "alt-tab-filter",
     "warning"
   )
-  windowFilter:setSortOrder(hs.window.filter.sortByFocusedLast)
-  windowFilter:keepActive()
+
+  -- Use macOS WindowServer true Z-order (hs.window.orderedWindows) to guarantee
+  -- that all windows across all applications (including multiple windows of the same app)
+  -- are accurately enumerated and ordered by true MRU focus without relying on fragile
+  -- or missing AXObserver events.
+  function windowFilter.getWindows(self, sortOrder)
+    local seen = {}
+    local result = {}
+
+    -- 1. Gather visible windows in exact front-to-back Z-order from macOS
+    for _, win in ipairs(hs.window.orderedWindows()) do
+      local id = win:id()
+      if id ~= nil and not seen[id] then
+        seen[id] = true
+        if predicate(win) then
+          table.insert(result, win)
+        end
+      end
+    end
+
+    -- 2. If minimized or hidden windows are included, find them from allWindows
+    if config.includeMinimized or config.includeHidden then
+      for _, win in ipairs(hs.window.allWindows()) do
+        local id = win:id()
+        if id ~= nil and not seen[id] then
+          local isMin = win:isMinimized()
+          local app = win:application()
+          local isHid = app ~= nil and app:isHidden()
+          if (config.includeMinimized and isMin) or (config.includeHidden and isHid) then
+            seen[id] = true
+            if predicate(win) then
+              table.insert(result, win)
+            end
+          end
+        end
+      end
+    end
+
+    return result
+  end
 
   local switcher = hs.window.switcher.new(
     windowFilter,
@@ -389,11 +429,6 @@ function M.start(options)
     "warning"
   )
   local layoutRepairTimer = nil
-  local lastFocusTime = 0
-
-  windowFilter:subscribe(hs.window.filter.windowFocused, function()
-    lastFocusTime = hs.timer.secondsSinceEpoch()
-  end)
 
   local function prepareListLayout(wasFresh)
     if not wasFresh then
@@ -419,14 +454,11 @@ function M.start(options)
   end
 
   local function isStaleQueuedActivation()
-    local now = hs.timer.secondsSinceEpoch()
-    -- If a window was just focused within 250ms and user is not holding Alt,
+    -- If user is no longer holding Alt when a fresh activation is dispatched,
     -- this is a stale buffered event from event queue backlog.
-    if (now - lastFocusTime) < 0.25 then
-      local mods = hs.eventtap.checkKeyboardModifiers(true)
-      if mods == nil or not mods.alt then
-        return true
-      end
+    local mods = hs.eventtap.checkKeyboardModifiers(true)
+    if mods == nil or not mods.alt then
+      return true
     end
     return false
   end
