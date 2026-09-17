@@ -309,57 +309,29 @@ local DEFAULT_STREAM_RESOURCE_ID = "volc.seedasr.sauc.duration"
 local STREAM_TIMEOUT = 10
 local MUTE_HOLD_SECONDS = 0.18
 
-local function listAudioDevices(ffmpeg)
-  local command = string.format(
-    "'%s' -hide_banner -f avfoundation -list_devices true -i '' 2>&1",
-    ffmpeg
-  )
-  local output = hs.execute(command)
-  local devices = {}
-  local inAudio = false
-  for line in (output or ""):gmatch("[^\n]+") do
-    if line:find("AVFoundation audio devices", 1, true) then
-      inAudio = true
-    elseif line:find("AVFoundation video devices", 1, true) then
-      inAudio = false
-    elseif inAudio then
-      local index, name = line:match("%[(%d+)%]%s+(.+)")
-      if index ~= nil then
-        devices[#devices + 1] = { index = index, name = name }
-      end
-    end
-  end
-  return devices
-end
-
-local function pickAudioDevice(ffmpeg, preferred)
+-- Resolve the device selected by macOS instead of guessing from the
+-- AVFoundation device list. The resolved name is passed to ffmpeg as an
+-- audio-only AVFoundation input (":<name>"). This keeps voice input aligned
+-- with System Settings and avoids stale device indexes after hardware changes.
+-- If preferred is explicitly specified, it will be respected.
+local function systemDefaultAudioDevice(preferred)
   if preferred ~= nil and preferred ~= "" then
-    return preferred
-  end
-
-  local best = nil
-  local bestScore = -1
-  for _, device in ipairs(listAudioDevices(ffmpeg)) do
-    local name = device.name or ""
-    local score = 3
-    if name:find("BlackHole", 1, true) or name:find("Virtual", 1, true) then
-      score = 0
-    elseif name:find("iPhone", 1, true) then
-      score = 1
-    elseif name:find("MacBook", 1, true) or name:find("Built%-in") then
-      score = 10
-    elseif name:find("麦克风") or name:find("Microphone") then
-      score = 5
+    if preferred:sub(1, 1) == ":" then
+      return preferred
     end
-    if score > bestScore then
-      best = device
-      bestScore = score
-    end
+    return ":" .. preferred
   end
-  if best == nil then
-    return ":0"
+  local ok, name = pcall(function()
+    local device = hs.audiodevice.defaultInputDevice()
+    return device and device:name()
+  end)
+  if ok and name ~= nil and name ~= "" then
+    return ":" .. name
   end
-  return ":" .. best.index
+  -- Keep a valid AVFoundation fallback while audio hardware is restarting.
+  -- Under normal operation defaultInputDevice() above always supplies the
+  -- system-selected device name.
+  return ":0"
 end
 
 local function executable(paths)
@@ -1944,9 +1916,10 @@ function M.start(options)
 
     -- hs.task cannot stream binary PCM, and a single s16le/wav file is not
     -- flushed until ffmpeg exits cleanly. Short WAV segments survive stop.
-    if state.captureDevice == nil then
-      state.captureDevice = pickAudioDevice(state.ffmpeg, state.audioDevice)
-    end
+    -- Resolve the system default for each new recording, then keep that
+    -- device fixed until the recording ends. Do not carry a previous device
+    -- index across hardware changes or automatically switch mid-recording.
+    state.captureDevice = systemDefaultAudioDevice(state.audioDevice)
     local audioArgs = {
       "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
       "-f", "avfoundation", "-i", state.captureDevice,
