@@ -13,6 +13,9 @@ WindowSwitcher = require("window_switcher").start({
   -- Cmd-H hidden applications stay out of the list.
   includeMinimized = true,
   includeHidden = false,
+  -- Keep Alt-Tab on the pointer's screen when the switching session starts.
+  -- Set false to include windows from all displays again.
+  currentScreenOnly = true,
 
   -- Built-in switcher UI: title-only, without window previews. Its native
   -- state machine keeps repeated Option-Tab presses fast and reliable.

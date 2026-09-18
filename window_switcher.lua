@@ -90,6 +90,35 @@ local function titleIsIgnored(title, appName, bundleID, titlePatterns)
     or (bundleID ~= nil and matchesAny(title, titlePatterns[bundleID]))
 end
 
+local function windowScreen(window)
+  if window == nil then
+    return nil
+  end
+  local ok, screen = pcall(function() return window:screen() end)
+  return ok and screen or nil
+end
+
+local function currentScreen()
+  -- The pointer defines the working screen, regardless of keyboard focus.
+  local s = hs.mouse.getCurrentScreen and hs.mouse.getCurrentScreen()
+  if s then return s end
+  s = hs.screen.mainScreen and hs.screen.mainScreen()
+  if s then return s end
+  s = hs.screen.primaryScreen and hs.screen.primaryScreen()
+  if s then return s end
+  local all = hs.screen.allScreens and hs.screen.allScreens()
+  return all and all[1] or nil
+end
+
+local function safeScreenFrame(screen)
+  local s = screen or currentScreen()
+  if s == nil then
+    return nil
+  end
+  local ok, frame = pcall(function() return s:frame() end)
+  return ok and frame or nil
+end
+
 local function makeWindowPredicate(config, ignored)
   local allowedSubroles = copyMap(config.allowedSubroles or DEFAULT_ALLOWED_SUBROLES)
 
@@ -181,7 +210,7 @@ end
 -- Reposition the built-in switcher's existing drawing objects as a vertical
 -- list. Selection, MRU order, repeat handling, and modifier release remain
 -- entirely owned by hs.window.switcher.
-local function layoutSwitcherAsList(switcher)
+local function layoutSwitcherAsList(switcher, screen)
   local windows = switcher.windows
   if windows == nil or #windows == 0 then
     return
@@ -189,7 +218,14 @@ local function layoutSwitcherAsList(switcher)
 
   local ui = switcher.ui
   local drawings = switcher.drawings
-  local screenFrame = hs.screen.mainScreen():frame()
+  if drawings == nil then
+    return
+  end
+
+  local screenFrame = safeScreenFrame(screen)
+  if screenFrame == nil then
+    return
+  end
   local availableWidth = math.max(240, screenFrame.w - 40)
   local minimumWidth = math.min(ui.listMinWidth, availableWidth)
   local maximumWidth = math.min(ui.listMaxWidth, availableWidth)
@@ -210,7 +246,7 @@ local function layoutSwitcherAsList(switcher)
   local height = (ui.listPadding * 2) + (rowHeight * #windows)
   local backgroundFrame = hs.geometry(
     math.floor(screenFrame.x + ((screenFrame.w - width) / 2)),
-    math.floor(screenFrame.y + ((screenFrame.h - height) / 2)),
+    math.floor(screenFrame.y + math.max(0, (screenFrame.h - height) / 2)),
     width,
     height
   )
@@ -266,42 +302,50 @@ end
 
 local function safeHide(drawing)
   if drawing ~= nil then
-    drawing:hide()
+    pcall(function() drawing:hide() end)
   end
 end
 
 -- hs.window.switcher does not expose its internal exit function. This mirrors
 -- only the small cleanup needed when a visible item is chosen with the mouse.
 local function dismissWithoutFocus(switcher)
+  if switcher == nil then
+    return nil
+  end
+  if switcher.clearSession ~= nil then
+    switcher.clearSession()
+  end
   local windows = switcher.windows
   if windows == nil then
     return nil
   end
 
   if switcher.drawDelayed ~= nil then
-    switcher.drawDelayed:stop()
+    pcall(function() switcher.drawDelayed:stop() end)
   end
   if switcher.modsTimer ~= nil then
-    switcher.modsTimer:stop()
+    pcall(function() switcher.modsTimer:stop() end)
     switcher.modsTimer = nil
   end
 
   local drawings = switcher.drawings
-  safeHide(drawings.background)
-  safeHide(drawings.highlightRect)
-  safeHide(drawings.selRect)
-  safeHide(drawings.selThumb)
-  safeHide(drawings.selIcon)
-  safeHide(drawings.selTitleRect)
-  safeHide(drawings.selTitleText)
+  if drawings ~= nil then
+    safeHide(drawings.background)
+    safeHide(drawings.highlightRect)
+    safeHide(drawings.selRect)
+    safeHide(drawings.selThumb)
+    safeHide(drawings.selIcon)
+    safeHide(drawings.selTitleRect)
+    safeHide(drawings.selTitleText)
 
-  for index = 1, #windows do
-    local item = drawings[index]
-    if item ~= nil then
-      safeHide(item.icon)
-      safeHide(item.thumb)
-      safeHide(item.titleRect)
-      safeHide(item.titleText)
+    for index = 1, #windows do
+      local item = drawings[index]
+      if item ~= nil then
+        safeHide(item.icon)
+        safeHide(item.thumb)
+        safeHide(item.titleRect)
+        safeHide(item.titleText)
+      end
     end
   end
 
@@ -371,6 +415,7 @@ function M.start(options)
   local config = {
     includeMinimized = options.includeMinimized ~= false,
     includeHidden = options.includeHidden == true,
+    currentScreenOnly = options.currentScreenOnly ~= false,
     allowedSubroles = options.allowedSubroles,
   }
   local ignored = normalizeIgnored(options.ignored)
@@ -381,6 +426,19 @@ function M.start(options)
     "alt-tab-filter",
     "warning"
   )
+  local switcher
+  local sessionScreen
+  local activatingScreen
+  local layoutRepairTimer = nil
+
+  local function clearSession()
+    sessionScreen = nil
+    activatingScreen = nil
+    if layoutRepairTimer ~= nil then
+      layoutRepairTimer:stop()
+      layoutRepairTimer = nil
+    end
+  end
 
   -- Use macOS WindowServer true Z-order (hs.window.orderedWindows) to guarantee
   -- that all windows across all applications (including multiple windows of the same app)
@@ -389,13 +447,38 @@ function M.start(options)
   function windowFilter.getWindows(self, sortOrder)
     local seen = {}
     local result = {}
+    -- Read ownership on every new invocation, so dragged/restored windows and
+    -- display changes are reflected without a stale per-window screen cache.
+    local targetScreen = activatingScreen
+      or (switcher and switcher.windows ~= nil and sessionScreen)
+      or currentScreen()
+    local targetScreenID
+    if targetScreen ~= nil then
+      local ok, id = pcall(function() return targetScreen:id() end)
+      targetScreenID = ok and id or nil
+    end
+
+    local function isCandidate(win)
+      if not predicate(win) then
+        return false
+      end
+      if not config.currentScreenOnly then
+        return true
+      end
+      local owner = windowScreen(win)
+      if targetScreenID == nil or owner == nil then
+        return false
+      end
+      local ok, ownerID = pcall(function() return owner:id() end)
+      return ok and ownerID == targetScreenID
+    end
 
     -- 1. Gather visible windows in exact front-to-back Z-order from macOS
     for _, win in ipairs(hs.window.orderedWindows()) do
       local id = win:id()
       if id ~= nil and not seen[id] then
         seen[id] = true
-        if predicate(win) then
+        if isCandidate(win) then
           table.insert(result, win)
         end
       end
@@ -411,7 +494,7 @@ function M.start(options)
           local isHid = app ~= nil and app:isHidden()
           if (config.includeMinimized and isMin) or (config.includeHidden and isHid) then
             seen[id] = true
-            if predicate(win) then
+            if isCandidate(win) then
               table.insert(result, win)
             end
           end
@@ -422,33 +505,38 @@ function M.start(options)
     return result
   end
 
-  local switcher = hs.window.switcher.new(
+  switcher = hs.window.switcher.new(
     windowFilter,
     mergeUI(options.ui),
     "alt-tab-switcher",
     "warning"
   )
-  local layoutRepairTimer = nil
+  switcher.clearSession = clearSession
 
   local function prepareListLayout(wasFresh)
     if not wasFresh then
       return
     end
 
-    layoutSwitcherAsList(switcher)
+    local activeWindows = switcher.windows
+    if activeWindows == nil or #activeWindows == 0 then
+      clearSession()
+      return
+    end
+
+    layoutSwitcherAsList(switcher, sessionScreen)
     attachClickCallbacks(switcher)
 
     -- On the first invocation the native switcher fills in title text after
     -- its 150 ms display delay and briefly reapplies horizontal assumptions.
     -- Restore only the drawing frames afterwards; no input state is involved.
-    local activeWindows = switcher.windows
     if layoutRepairTimer ~= nil then
       layoutRepairTimer:stop()
     end
     layoutRepairTimer = hs.timer.doAfter(0.16, function()
       layoutRepairTimer = nil
       if switcher.windows == activeWindows then
-        layoutSwitcherAsList(switcher)
+        layoutSwitcherAsList(switcher, sessionScreen)
       end
     end)
   end
@@ -463,22 +551,40 @@ function M.start(options)
     return false
   end
 
-  local function nextWindow()
+  local function cycleWindow(backwards)
     local wasFresh = switcher.windows == nil
     if wasFresh and isStaleQueuedActivation() then
+      clearSession()
       return
     end
-    switcher:next()
+    if wasFresh then
+      sessionScreen = currentScreen()
+      activatingScreen = sessionScreen
+      -- The native switcher caches layout by window count. Invalidate it even
+      -- when the next screen happens to have the same number of windows.
+      if switcher.drawings then
+        switcher.drawings.screenFrame = safeScreenFrame(sessionScreen)
+        switcher.drawings.lastn = nil
+      end
+    end
+    if backwards then
+      switcher:previous()
+    else
+      switcher:next()
+    end
+    activatingScreen = nil
+    if switcher.windows == nil then
+      clearSession()
+    end
     prepareListLayout(wasFresh)
   end
 
+  local function nextWindow()
+    cycleWindow(false)
+  end
+
   local function previousWindow()
-    local wasFresh = switcher.windows == nil
-    if wasFresh and isStaleQueuedActivation() then
-      return
-    end
-    switcher:previous()
-    prepareListLayout(wasFresh)
+    cycleWindow(true)
   end
 
   local controller = {
@@ -516,14 +622,12 @@ function M.start(options)
 
   function controller.cancel()
     dismissWithoutFocus(switcher)
+    clearSession()
   end
 
   function controller.stop(self)
     dismissWithoutFocus(switcher)
-    if layoutRepairTimer ~= nil then
-      layoutRepairTimer:stop()
-      layoutRepairTimer = nil
-    end
+    clearSession()
     local target = (type(self) == "table" and self) or controller
     for _, hotkey in pairs(target.hotkeys or {}) do
       hotkey:delete()
