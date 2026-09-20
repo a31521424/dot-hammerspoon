@@ -368,6 +368,14 @@
         <button class="btn btn-primary" onclick="saveMappings()">保存当前映射配置</button>
       </div>
 
+      <div id="bundleIDsRow" style="display: none; margin-bottom: 12px; margin-top: 10px;">
+        <div class="form-row">
+          <div class="form-label" style="width: 140px;">关联 Bundle ID 列表:</div>
+          <input class="form-input" id="profileBundleIDs" placeholder="以逗号或空格分隔，如 com.apple.Terminal, com.googlecode.iterm2" onchange="updateProfileBundleIDs(this.value)" />
+        </div>
+        <div style="font-size: 11px; color: var(--text-dim); margin-left: 152px;">支持逗号或空格分隔多个 Bundle ID；同一 Bundle 同时存在时终端优先。</div>
+      </div>
+
       <table>
         <thead>
           <tr>
@@ -394,7 +402,7 @@
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 12px;">
         <div>当前前台应用: <strong id="frontApp" style="color: var(--accent-hover);">--</strong></div>
         <div>当前活跃模式: <strong id="activeLayer" style="color: var(--success);">标准模式</strong></div>
-        <div>语音服务状态: <strong id="voiceStatus" style="color: var(--purple);">正常待机 (F18 握手可用)</strong></div>
+        <div>语音服务状态: <strong id="voiceStatus" style="color: var(--purple);">待检测</strong></div>
         <div>窗口切换器状态: <strong style="color: var(--text-bright);">已集成 window_switcher</strong></div>
       </div>
     </div>
@@ -503,6 +511,22 @@
       const profileData = (currentConfig.profiles && currentConfig.profiles[profile]) || {};
       const keys = profileData.keys || {};
 
+      const bundleRow = document.getElementById('bundleIDsRow');
+      const bundleInput = document.getElementById('profileBundleIDs');
+      if (profile === 'terminal' || profile === 'browser') {
+        bundleRow.style.display = 'block';
+        const bids = profileData.bundleIDs;
+        if (Array.isArray(bids)) {
+          bundleInput.value = bids.join(', ');
+        } else if (typeof bids === 'string') {
+          bundleInput.value = bids;
+        } else {
+          bundleInput.value = '';
+        }
+      } else {
+        bundleRow.style.display = 'none';
+      }
+
       for (let k in keyLabels) {
         const row = document.createElement('tr');
         const currentTap = keys[k] ? (keys[k].tap || '') : '';
@@ -517,6 +541,13 @@
         `;
         tbody.appendChild(row);
       }
+    }
+
+    function updateProfileBundleIDs(val) {
+      const profile = document.getElementById('profileSelect').value;
+      if (!currentConfig.profiles[profile]) currentConfig.profiles[profile] = { keys: {} };
+      const tokens = val.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+      currentConfig.profiles[profile].bundleIDs = tokens;
     }
 
     function buildSelect(key, type, currentVal) {
@@ -538,6 +569,13 @@
     }
 
     function saveMappings() {
+      const profile = document.getElementById('profileSelect').value;
+      if (profile === 'terminal' || profile === 'browser') {
+        const bundleInput = document.getElementById('profileBundleIDs');
+        if (bundleInput) {
+          updateProfileBundleIDs(bundleInput.value);
+        }
+      }
       callLua('save_config', currentConfig);
     }
 
@@ -584,8 +622,9 @@
     }
 
     function onUpdateStatus(status) {
-      if (status.frontApp) document.getElementById('frontApp').innerText = status.frontApp;
-      if (status.activeLayer) document.getElementById('activeLayer').innerText = status.activeLayer;
+      if (status.frontApp) document.getElementById('frontApp').textContent = status.frontApp;
+      if (status.activeLayer) document.getElementById('activeLayer').textContent = status.activeLayer;
+      if (status.voiceStatus) document.getElementById('voiceStatus').textContent = status.voiceStatus;
       if (status.hidDevices) document.getElementById('hidDeviceList').innerHTML = status.hidDevices;
       if (status.recentLogs && status.recentLogs.length > 0) {
         const logList = document.getElementById('logList');

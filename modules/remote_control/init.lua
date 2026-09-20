@@ -4,7 +4,7 @@
 --   - Device isolation via macOS hidutil
 --   - Tap / Hold / Double-click state machine
 --   - Per-App profiles (Terminal/Termux, Web Browser, Global)
---   - Native integration with VoiceInput (streaming Doubao ASR via F18)
+--   - Native integration with VoiceInput (streaming Doubao ASR)
 --   - Native integration with WindowSwitcher (vertical Alt-Tab)
 --   - Persistent Control Panel (Dashboard) via hs.webview
 
@@ -103,7 +103,7 @@ M._hidutilApplyPayload = function()
   return hs.json.encode({ UserKeyMapping = hidutilUserKeyMapping() })
 end
 
-local TERMINAL_BUNDLES = {
+local DEFAULT_TERMINAL_BUNDLES = {
   ["com.mitchellh.ghostty"] = true,
   ["com.googlecode.iterm2"] = true,
   ["com.apple.Terminal"] = true,
@@ -113,7 +113,7 @@ local TERMINAL_BUNDLES = {
   ["dev.warp.Warp-GDK"] = true,
 }
 
-local BROWSER_BUNDLES = {
+local DEFAULT_BROWSER_BUNDLES = {
   ["com.google.Chrome"] = true,
   ["company.thebrowser.Arc"] = true,
   ["com.apple.Safari"] = true,
@@ -131,6 +131,10 @@ local state = {
   isDashboardVisible = false,
   mouseMode = false,
   mouseTimer = nil,
+  mouseHeldKey = nil,
+  _testBundleID = nil,
+  terminalBundles = DEFAULT_TERMINAL_BUNDLES,
+  browserBundles = DEFAULT_BROWSER_BUNDLES,
   activeKeys = {},
   keyTimers = {},
   doubleTapTimers = {},
@@ -141,6 +145,55 @@ local state = {
   lockWatcher = nil,
   sessionLocked = false,
 }
+
+local function addBundleTokens(targetMap, raw)
+  if type(raw) == "table" then
+    for _, item in ipairs(raw) do
+      if type(item) == "string" then
+        for token in item:gmatch("[^%s,]+") do
+          targetMap[token] = true
+        end
+      end
+    end
+  elseif type(raw) == "string" then
+    for token in raw:gmatch("[^%s,]+") do
+      targetMap[token] = true
+    end
+  end
+end
+
+local function rebuildBundleMaps()
+  local term = {}
+  local brow = {}
+  for k, v in pairs(DEFAULT_TERMINAL_BUNDLES) do
+    term[k] = v
+  end
+  for k, v in pairs(DEFAULT_BROWSER_BUNDLES) do
+    brow[k] = v
+  end
+
+  local cfg = state.config
+  if cfg and cfg.profiles then
+    if cfg.profiles.terminal and cfg.profiles.terminal.bundleIDs then
+      addBundleTokens(term, cfg.profiles.terminal.bundleIDs)
+    end
+    if cfg.profiles.browser and cfg.profiles.browser.bundleIDs then
+      addBundleTokens(brow, cfg.profiles.browser.bundleIDs)
+    end
+  end
+
+  -- Terminal priority: if a bundle ID is in both, remove it from browser
+  for k, _ in pairs(term) do
+    brow[k] = nil
+  end
+
+  state.terminalBundles = term
+  state.browserBundles = brow
+  M.terminalBundles = term
+  M.browserBundles = brow
+end
+M.rebuildBundleMaps = rebuildBundleMaps
+rebuildBundleMaps()
 
 local function fileExists(path)
   return hs.fs.attributes(path, "mode") == "file"
@@ -182,6 +235,7 @@ end
 
 local function saveConfig(newConfig)
   state.config = newConfig
+  rebuildBundleMaps()
   local ok, err = pcall(function()
     hs.json.write(newConfig, CONFIG_FILE, true, true)
   end)
@@ -198,23 +252,40 @@ local function updateAppTrack()
   local app = hs.application.frontmostApplication()
   if not app then return end
   local bid = app:bundleID()
-  if bid and TERMINAL_BUNDLES[bid] then
+  local termMap = state.terminalBundles or DEFAULT_TERMINAL_BUNDLES
+  local browMap = state.browserBundles or DEFAULT_BROWSER_BUNDLES
+  if bid and termMap[bid] then
     state.lastFocusedTerminal = app
-  elseif bid and BROWSER_BUNDLES[bid] then
+  elseif bid and browMap[bid] then
     state.lastFocusedBrowser = app
   end
 end
 
 local function currentProfile()
-  local app = hs.application.frontmostApplication()
-  local bid = app and app:bundleID()
-  if bid and TERMINAL_BUNDLES[bid] then
-    return "terminal", app:name() or bid
-  elseif bid and BROWSER_BUNDLES[bid] then
-    return "browser", app:name() or bid
+  local bid
+  local appTitle = "System"
+  if state._testBundleID then
+    bid = state._testBundleID
+    appTitle = bid
+  else
+    local app = hs.application.frontmostApplication()
+    if app then
+      bid = app:bundleID()
+      appTitle = app:name() or bid or "System"
+    end
   end
-  return "global", app and app:name() or "System"
+
+  local termMap = state.terminalBundles or DEFAULT_TERMINAL_BUNDLES
+  local browMap = state.browserBundles or DEFAULT_BROWSER_BUNDLES
+
+  if bid and termMap[bid] then
+    return "terminal", appTitle
+  elseif bid and browMap[bid] then
+    return "browser", appTitle
+  end
+  return "global", appTitle
 end
+M.currentProfile = currentProfile
 
 local function listenerRunning()
   return state.hidTask ~= nil and state.hidTask:isRunning()
@@ -305,6 +376,8 @@ local function parseKeyStroke(str)
   return mods, key
 end
 
+local stopMouseTimer
+
 -- Action Dispatcher
 local function executeAction(actionStr, keyName, eventType)
   if not actionStr or actionStr == "" then return end
@@ -324,11 +397,6 @@ local function executeAction(actionStr, keyName, eventType)
         logToFile("VoiceInput: stop() invoked")
         if VoiceInput.stop then VoiceInput:stop() end
       end
-    else
-      -- Fallback to posting virtual F18 key
-      local isDown = (eventType == "down")
-      local evt = hs.eventtap.event.newKeyEvent(79, isDown)
-      evt:post()
     end
     return
   end
@@ -338,8 +406,10 @@ local function executeAction(actionStr, keyName, eventType)
 
   -- 2. Window Switcher (Alt-Tab)
   if actionStr == "action:window_switcher" then
-    logToFile("Executing window_switcher via alt-tab keyStroke")
-    hs.eventtap.keyStroke({ "alt" }, "tab", 10000)
+    logToFile("Executing window_switcher via WindowSwitcher.next")
+    if WindowSwitcher and WindowSwitcher.next then
+      WindowSwitcher.next({ source = "remote" })
+    end
     return
   end
 
@@ -392,7 +462,12 @@ local function executeAction(actionStr, keyName, eventType)
 
   -- 5. Mouse Mode
   if actionStr == "action:toggle_mouse_mode" then
-    state.mouseMode = not state.mouseMode
+    if state.mouseMode then
+      stopMouseTimer()
+      state.mouseMode = false
+    else
+      state.mouseMode = true
+    end
     hs.alert.show(state.mouseMode and "🖱️ 遥控器已开启鼠标模式" or "⌨️ 遥控器已恢复按键模式", 1.5)
     return
   end
@@ -412,7 +487,8 @@ local function executeAction(actionStr, keyName, eventType)
     local app = hs.application.frontmostApplication()
     if app then
       local bid = app:bundleID() or ""
-      if BROWSER_BUNDLES[bid] then
+      local browMap = state.browserBundles or DEFAULT_BROWSER_BUNDLES
+      if browMap[bid] then
         hs.eventtap.keyStroke({ "cmd" }, "l", 10000)
       else
         app:activate()
@@ -428,6 +504,7 @@ local function executeAction(actionStr, keyName, eventType)
   end
 
   if actionStr == "action:escape_layer" then
+    stopMouseTimer()
     state.mouseMode = false
     if WindowSwitcher and WindowSwitcher.cancel then
       WindowSwitcher.cancel()
@@ -567,7 +644,7 @@ local function pushEventToDashboard(keyName, eventType, action, frontApp)
   end
 end
 
-local function stopMouseTimer()
+stopMouseTimer = function()
   if state.mouseTimer ~= nil then
     pcall(function() state.mouseTimer:stop() end)
     state.mouseTimer = nil
@@ -576,34 +653,35 @@ local function stopMouseTimer()
 end
 M.stopMouseTimer = stopMouseTimer
 
--- Mouse Mode handler (Direction ring moves pointer, OK is left click, Back is right click, Vol+/Vol- is scroll wheel)
-local function handleMouseMovement(keyName)
+local function doMouseStep(keyName, factor)
+  factor = factor or 1
+  if M._mockExecuteAction then
+    M._mockExecuteAction("mouse:" .. keyName, keyName, "step")
+    return
+  end
+  local settings = (state.config and state.config.settings) or {}
+  local speed = settings.mouseSpeed or 14
+  local step = speed * factor
+
   local pos = hs.mouse.absolutePosition()
-  local speed = (state.config.settings and state.config.settings.mouseSpeed) or 15
   local dx, dy = 0, 0
-  if keyName == "up" then dy = -speed
-  elseif keyName == "down" then dy = speed
-  elseif keyName == "left" then dx = -speed
-  elseif keyName == "right" then dx = speed
-  elseif keyName == "ok" then
-    hs.eventtap.leftClick(pos)
-    return true
-  elseif keyName == "back" then
-    hs.eventtap.rightClick(pos)
-    return true
+  if keyName == "up" then dy = -step
+  elseif keyName == "down" then dy = step
+  elseif keyName == "left" then dx = -step
+  elseif keyName == "right" then dx = step
   elseif keyName == "volume_up" then
-    hs.eventtap.scrollWheel({ 0, 4 }, {}, "line")
-    return true
+    local lines = math.max(1, math.floor(4 * factor))
+    hs.eventtap.scrollWheel({ 0, lines }, {}, "line")
+    return
   elseif keyName == "volume_down" then
-    hs.eventtap.scrollWheel({ 0, -4 }, {}, "line")
-    return true
+    local lines = math.max(1, math.floor(4 * factor))
+    hs.eventtap.scrollWheel({ 0, -lines }, {}, "line")
+    return
   end
 
   if dx ~= 0 or dy ~= 0 then
     hs.mouse.absolutePosition({ x = pos.x + dx, y = pos.y + dy })
-    return true
   end
-  return false
 end
 
 -- Core Key Input Handler (Accepts either virtual keyCode or direct keyName string)
@@ -638,14 +716,106 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   logToFile("handleKeyEvent: keyName=%s keyCode=%s isDown=%s isRepeat=%s profile=%s app=%s",
     keyName, tostring(keyCode), tostring(isDown), tostring(isRepeat), profileName, appTitle or "System")
 
+  -- Window switcher interception when active
+  if WindowSwitcher and WindowSwitcher.isVisible and WindowSwitcher.isVisible() then
+    if isDown then
+      if keyName == "down" or keyName == "right" then
+        WindowSwitcher.next({ source = "remote" })
+        pushEventToDashboard(keyName, "down", "switcher:next", appTitle)
+        return true
+      elseif keyName == "up" or keyName == "left" then
+        WindowSwitcher.previous({ source = "remote" })
+        pushEventToDashboard(keyName, "down", "switcher:previous", appTitle)
+        return true
+      elseif keyName == "ok" then
+        WindowSwitcher.confirm()
+        pushEventToDashboard(keyName, "down", "switcher:confirm", appTitle)
+        return true
+      elseif keyName == "back" or keyName == "menu" then
+        if WindowSwitcher.cancel then WindowSwitcher.cancel() end
+        pushEventToDashboard(keyName, "down", "switcher:cancel", appTitle)
+        return true
+      end
+    else
+      return true
+    end
+  end
+
   -- Mouse mode interception
   if state.mouseMode and keyName ~= "power" and keyName ~= "voice" then
     if isDown then
-      handleMouseMovement(keyName)
-      local actionDesc = (keyName:find("volume") and "scroll") or "move_pointer"
-      pushEventToDashboard(keyName, "mouse", actionDesc, appTitle)
+      if keyName == "ok" or keyName == "back" then
+        stopMouseTimer()
+        if M._mockExecuteAction then
+          M._mockExecuteAction("mouse:" .. keyName, keyName, "click")
+        else
+          local pos = hs.mouse.absolutePosition()
+          if keyName == "ok" then
+            hs.eventtap.leftClick(pos)
+          else
+            hs.eventtap.rightClick(pos)
+          end
+        end
+        pushEventToDashboard(keyName, "mouse", keyName == "ok" and "left_click" or "right_click", appTitle)
+        return true
+      elseif keyName == "up" or keyName == "down" or keyName == "left" or keyName == "right"
+          or keyName == "volume_up" or keyName == "volume_down" then
+        if state.mouseHeldKey == keyName then
+          return true
+        end
+        stopMouseTimer()
+        state.mouseHeldKey = keyName
+
+        local ticks = 0
+        local settings = (state.config and state.config.settings) or {}
+        local accel = settings.mouseAcceleration or 1.2
+        local function doStep()
+          local factor = math.min(4, accel ^ (ticks / 8))
+          doMouseStep(keyName, factor)
+          ticks = ticks + 1
+        end
+
+        doStep()
+        state.mouseTimer = hs.timer.doEvery(0.016, function()
+          doStep()
+        end)
+
+        local actionDesc = (keyName:find("volume") and "scroll") or "move_pointer"
+        pushEventToDashboard(keyName, "mouse", actionDesc, appTitle)
+        return true
+      else
+        stopMouseTimer()
+        return true
+      end
+    else
+      -- KeyUp in mouse mode
+      if state.mouseHeldKey == keyName then
+        stopMouseTimer()
+      end
+      return true
     end
-    return true
+  end
+
+  -- Configurable voice key check (hold-to-talk on down/up if tap OR hold mapped to action:voice_input)
+  local tapAction = resolveKeyAction(keyName, "tap")
+  local holdAction = resolveKeyAction(keyName, "hold")
+  local isVoiceHoldToTalk = (tapAction == "action:voice_input" or holdAction == "action:voice_input")
+
+  if isVoiceHoldToTalk then
+    if isDown then
+      if isRepeat or state.activeKeys[keyName] then
+        return true
+      end
+      state.activeKeys[keyName] = true
+      executeAction("action:voice_input", keyName, "down")
+      pushEventToDashboard(keyName, "down", "action:voice_input", appTitle)
+      return true
+    else
+      state.activeKeys[keyName] = nil
+      executeAction("action:voice_input", keyName, "up")
+      pushEventToDashboard(keyName, "up", "action:voice_input", appTitle)
+      return true
+    end
   end
 
   local holdMs = (state.config.settings and state.config.settings.holdThresholdMs) or 350
@@ -661,16 +831,7 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     state.activeKeys[keyName] = true
 
     -- Immediate visual feedback on KeyDown in Dashboard
-    if keyName ~= "voice" then
-      pushEventToDashboard(keyName, "down", resolveKeyAction(keyName, "tap") or "--", appTitle)
-    end
-
-    -- Special handling for voice: Start immediately on KeyDown
-    if keyName == "voice" then
-      executeAction("action:voice_input", keyName, "down")
-      pushEventToDashboard(keyName, "down", "action:voice_input", appTitle)
-      return true
-    end
+    pushEventToDashboard(keyName, "down", tapAction or "--", appTitle)
 
     -- Check if there is a pending double-tap timer for this key
     if state.doubleTapTimers[keyName] then
@@ -699,13 +860,6 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   else
     -- KeyUp
     state.activeKeys[keyName] = nil
-
-    -- Special handling for voice: Stop immediately on KeyUp
-    if keyName == "voice" then
-      executeAction("action:voice_input", keyName, "up")
-      pushEventToDashboard(keyName, "up", "action:voice_input", appTitle)
-      return true
-    end
 
     -- If hold timer was still pending, this was a short press (Tap or Double Tap)
     if state.keyTimers[keyName] ~= nil then
@@ -1026,6 +1180,7 @@ function M.refreshDashboardData()
     hidDevices = formattedDevices ~= "" and formattedDevices or "未能识别到外部 HID 设备",
     recentLogs = recentLogLines,
     listenerRunning = listenerRunning(),
+    voiceStatus = VoiceInput and "已加载" or "未加载",
   })
   state.dashboard:evaluateJavaScript(string.format("if (window.onUpdateStatus) { window.onUpdateStatus(%s); }", statusJson))
 end
@@ -1144,6 +1299,7 @@ function M.start(options)
   options = options or {}
   state.config = loadConfig()
   rebuildTransitKeyMap()   -- add in PR 2 (HIDUTIL_MAPPINGS exists)
+  rebuildBundleMaps()      -- add in PR 3 (bundle routing)
   setupEventTap()
   resetHidutil()
   startHidListener()
@@ -1210,5 +1366,8 @@ M.testFireDoubleTapTimer = function(keyName)
   executeAction(action, keyName, "tap")
   pushEventToDashboard(keyName, "tap", action, "Test")
 end
+M.currentProfile = currentProfile
+M.rebuildBundleMaps = rebuildBundleMaps
+M.stopMouseTimer = stopMouseTimer
 
 return M

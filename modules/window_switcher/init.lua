@@ -551,9 +551,11 @@ function M.start(options)
     return false
   end
 
-  local function cycleWindow(backwards)
+  local function cycleWindow(backwards, opts)
+    opts = (type(opts) == "table" and opts) or {}
+    local remote = opts.source == "remote"
     local wasFresh = switcher.windows == nil
-    if wasFresh and isStaleQueuedActivation() then
+    if wasFresh and (not remote) and isStaleQueuedActivation() then
       clearSession()
       return
     end
@@ -571,6 +573,12 @@ function M.start(options)
       switcher:previous()
     else
       switcher:next()
+    end
+    if remote then
+      if switcher.modsTimer ~= nil then
+        pcall(function() switcher.modsTimer:stop() end)
+        switcher.modsTimer = nil
+      end
     end
     activatingScreen = nil
     if switcher.windows == nil then
@@ -607,12 +615,22 @@ function M.start(options)
     return #filter:getWindows()
   end
 
-  function controller.next()
-    nextWindow()
+  function controller.next(opts)
+    cycleWindow(false, opts)
   end
 
-  function controller.previous()
-    previousWindow()
+  function controller.previous(opts)
+    cycleWindow(true, opts)
+  end
+
+  function controller.confirm()
+    if switcher.windows == nil or switcher.selected == nil then return false end
+    clickWindow(switcher, switcher.selected)
+    return true
+  end
+
+  function controller.isVisible()
+    return switcher.windows ~= nil
   end
 
   function controller.clickIndex(self, index)

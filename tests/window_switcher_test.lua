@@ -146,4 +146,38 @@ global:stop()
 local noMinimized = module.start({ includeMinimized = false })
 expectIDs(noMinimized.windowFilter:getWindows(), "1")
 noMinimized:stop()
+
+-- Remote source tests (FIX-11)
+local remoteCtrl = module.start()
+alt = false
+focused, pointer = a1, a
+
+-- Keyboard next() without alt=true must remain nil (stale activation guard)
+remoteCtrl.next()
+assert(remoteCtrl.switcher.windows == nil, "next() without alt must not activate")
+assert(remoteCtrl.isVisible() == false, "isVisible() must be false")
+
+-- Remote next({source="remote"}) must activate even if alt=false
+remoteCtrl.next({ source = "remote" })
+assert(remoteCtrl.switcher.windows ~= nil, "next({source='remote'}) must open switcher")
+assert(remoteCtrl.isVisible() == true, "isVisible() must be true")
+
+-- Remote previous({source="remote"})
+remoteCtrl.previous({ source = "remote" })
+assert(remoteCtrl.isVisible() == true, "isVisible() must remain true after previous")
+
+-- Remote cancel: dismiss without focusing new window
+remoteCtrl.cancel()
+assert(remoteCtrl.switcher.windows == nil, "switcher should be dismissed after cancel")
+assert(remoteCtrl.isVisible() == false, "isVisible() must be false after cancel")
+
+-- Remote next + confirm: focuses window
+remoteCtrl.next({ source = "remote" })
+assert(remoteCtrl.isVisible() == true)
+remoteCtrl.confirm()
+assert(remoteCtrl.switcher.windows == nil, "switcher should be dismissed after confirm")
+assert(remoteCtrl.isVisible() == false)
+
+remoteCtrl:stop()
+
 return "PASS: pointer-based screen ownership, session isolation, layout, movement, minimized windows, fallbacks, reverse/click selection and all-screen opt-out"

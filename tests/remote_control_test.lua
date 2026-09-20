@@ -246,8 +246,13 @@ print("[Test 6] Mouse Mode: Pointer & Scroll Wheel check...")
 state.mouseMode = true
 local eatenVolUp = RC.testTriggerKey("volume_up", true, false)
 assertTrue(eatenVolUp, "Mouse mode volume_up should be consumed")
+local eatenVolUpRelease = RC.testTriggerKey("volume_up", false, false)
+assertTrue(eatenVolUpRelease, "Mouse mode volume_up release should be consumed")
 local eatenVolDown = RC.testTriggerKey("volume_down", true, false)
 assertTrue(eatenVolDown, "Mouse mode volume_down should be consumed")
+local eatenVolDownRelease = RC.testTriggerKey("volume_down", false, false)
+assertTrue(eatenVolDownRelease, "Mouse mode volume_down release should be consumed")
+if RC.stopMouseTimer then RC.stopMouseTimer() end
 state.mouseMode = false
 print("  ✓ Mouse mode scroll wheel integration verified.")
 
@@ -305,6 +310,54 @@ local returnEaten = RC.testTriggerKey(36, true, false)
 assertFalse(returnEaten, "Keycode 36 (Return) must NOT be swallowed when locked (login window pass-through)")
 state.sessionLocked = false
 print("  ✓ Remote keys strictly swallowed during lock; real keyboard passes through.")
+
+-- FIX-02: Profile routing based on bundleIDs
+print("[Test 9] Profile Routing with Custom bundleIDs check...")
+state.config.profiles = state.config.profiles or {}
+state.config.profiles.terminal = state.config.profiles.terminal or { keys = {} }
+state.config.profiles.terminal.bundleIDs = { "com.example.customterm" }
+state.config.profiles.browser = state.config.profiles.browser or { keys = {} }
+state.config.profiles.browser.bundleIDs = { "com.example.custombrowser" }
+RC.rebuildBundleMaps()
+
+state._testBundleID = "com.example.customterm"
+local profTerm = RC.currentProfile()
+assertEq(profTerm, "terminal", "Custom terminal bundleID should route to terminal profile")
+
+state._testBundleID = "com.example.custombrowser"
+local profBrow = RC.currentProfile()
+assertEq(profBrow, "browser", "Custom browser bundleID should route to browser profile")
+
+state._testBundleID = "com.example.unknownapp"
+local profGlobal = RC.currentProfile()
+assertEq(profGlobal, "global", "Unknown bundleID should route to global profile")
+
+-- Overlap test: terminal priority
+state.config.profiles.terminal.bundleIDs = { "com.example.sharedapp" }
+state.config.profiles.browser.bundleIDs = { "com.example.sharedapp" }
+RC.rebuildBundleMaps()
+state._testBundleID = "com.example.sharedapp"
+local profShared = RC.currentProfile()
+assertEq(profShared, "terminal", "Terminal profile must take precedence over browser for shared bundleID")
+
+state._testBundleID = nil
+print("  ✓ Custom bundleIDs routing and terminal precedence verified.")
+
+-- FIX-12: Configurable voice key
+print("[Test 10] Configurable Voice Key check...")
+local savedVoiceCfg = state.config.profiles.global.keys.voice
+state.config.profiles.global.keys.voice = { tap = "key:return" }
+state._testBundleID = "com.test.global"
+executed = {}
+RC.testTriggerKey("voice", true, false)
+assertEq(#executed, 0, "Remapped voice key should NOT trigger on down")
+RC.testTriggerKey("voice", false, false)
+assertEq(#executed, 1, "Remapped voice key should trigger tap on up")
+assertEq(executed[1].type, "tap", "Action type should be tap")
+assertEq(executed[1].action, "key:return", "Action should resolve to key:return")
+state.config.profiles.global.keys.voice = savedVoiceCfg
+state._testBundleID = nil
+print("  ✓ Remapped voice key follows normal tap lifecycle.")
 
 -- Teardown (Algorithm G): stop all timers before clearing mock, so background timers never fire to real desktop
 for _, t in pairs(state.keyTimers or {}) do pcall(function() t:stop() end) end
