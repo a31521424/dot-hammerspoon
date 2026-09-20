@@ -50,18 +50,58 @@ local function logToFile(fmt, ...)
   log.d(msg)
 end
 
--- Default transit key mappings (Virtual F13-F20 exclusively mapped from remote via hidutil/IOHID)
+-- Default transit key mappings (Virtual F13-F24 exclusively mapped from remote via hidutil/IOHID)
 -- Standard keyboard keys (F1-F12) MUST NEVER be placed here to prevent hijacking user keyboard!
-local TRANSIT_KEY_MAP = {
-  [105] = "up",          -- F13
-  [107] = "down",        -- F14
-  [113] = "left",        -- F15
-  [106] = "right",       -- F16
-  [64]  = "ok",          -- F17
-  [79]  = "voice",       -- F18 (Dedicated voice input key via hidutil / IOHID)
-  [80]  = "back",        -- F19 (Back key via hidutil / IOHID)
-  [90]  = "menu",        -- F20 (Window switcher via hidutil)
+local HIDUTIL_MAPPINGS = {
+  { src = 0x700000052, dst = 0x700000068, keycode = 105, key = "up" },
+  { src = 0x700000051, dst = 0x700000069, keycode = 107, key = "down" },
+  { src = 0x700000050, dst = 0x70000006A, keycode = 113, key = "left" },
+  { src = 0x70000004F, dst = 0x70000006B, keycode = 106, key = "right" },
+  { src = 0x700000028, dst = 0x70000006C, keycode = 64,  key = "ok" },
+  { src = 0x70000003E, dst = 0x70000006D, keycode = 79,  key = "voice" },
+  { src = 0x700000065, dst = 0x70000006F, keycode = 90,  key = "menu" },
+  { src = 0x700000035, dst = 0x700000070, keycode = 144, key = "tv" },
+  { src = 0x700000080, dst = 0x700000071, keycode = 145, key = "volume_up" },
+  { src = 0xC000000E9, dst = 0x700000071, keycode = 145, key = "volume_up" },
+  { src = 0x700000081, dst = 0x700000072, keycode = 146, key = "volume_down" },
+  { src = 0xC000000EA, dst = 0x700000072, keycode = 146, key = "volume_down" },
+  { src = 0x70000004A, dst = 0x70000006E, keycode = 80,  key = "home" },
+  { src = 0xC00000223, dst = 0x70000006E, keycode = 80,  key = "home" },
+  { src = 0x700000066, dst = 0x700000073, keycode = 147, key = "power" },
+  { src = 0xC00000030, dst = 0x700000073, keycode = 147, key = "power" },
+  { src = 0xC00000224, dst = 0x70000006E, keycode = 80,  key = "back", isolationOnly = true },
 }
+M.HIDUTIL_MAPPINGS = HIDUTIL_MAPPINGS
+
+local TRANSIT_KEY_MAP = {}
+
+local function hidutilUserKeyMapping()
+  local mappings = {}
+  for _, row in ipairs(HIDUTIL_MAPPINGS) do
+    mappings[#mappings + 1] = {
+      HIDKeyboardModifierMappingSrc = row.src,
+      HIDKeyboardModifierMappingDst = row.dst,
+    }
+  end
+  return mappings
+end
+
+local function rebuildTransitKeyMap()
+  local map = {}
+  for _, row in ipairs(HIDUTIL_MAPPINGS) do
+    if not row.isolationOnly then
+      map[row.keycode] = row.key
+    end
+  end
+  TRANSIT_KEY_MAP = map
+  M.TRANSIT_KEY_MAP = map
+end
+M.rebuildTransitKeyMap = rebuildTransitKeyMap
+rebuildTransitKeyMap()
+
+M._hidutilApplyPayload = function()
+  return hs.json.encode({ UserKeyMapping = hidutilUserKeyMapping() })
+end
 
 local TERMINAL_BUNDLES = {
   ["com.mitchellh.ghostty"] = true,
@@ -98,6 +138,8 @@ local state = {
   recentLogs = {},
   lastFocusedTerminal = nil,
   lastFocusedBrowser = nil,
+  lockWatcher = nil,
+  sessionLocked = false,
 }
 
 local function fileExists(path)
@@ -174,52 +216,35 @@ local function currentProfile()
   return "global", app and app:name() or "System"
 end
 
+local function listenerRunning()
+  return state.hidTask ~= nil and state.hidTask:isRunning()
+end
+M.listenerRunning = listenerRunning
+
 -- Device isolation via hidutil
 local function applyHidutil(vendorID, productID)
-  vendorID = vendorID or (state.config.device and state.config.device.vendorID) or 10007
-  productID = productID or (state.config.device and state.config.device.productID) or 12984
+  local dev = (state.config and state.config.device) or {}
+  local vid = vendorID or dev.vendorID or 10007
+  local pid = productID or dev.productID or 12984
 
-  if vendorID == 0 or productID == 0 then
+  if vid == 0 or pid == 0 then
     log.w("Invalid vendorID/productID, skipping hidutil setup")
     return false
   end
 
-  -- Remap physical remote usages to transit virtual keys (F13-F24)
-  local mappings = {
-    -- Direction ring: Up, Down, Left, Right -> F13, F14, F15, F16
-    { HIDKeyboardModifierMappingSrc = 0x700000052, HIDKeyboardModifierMappingDst = 0x700000068 },
-    { HIDKeyboardModifierMappingSrc = 0x700000051, HIDKeyboardModifierMappingDst = 0x700000069 },
-    { HIDKeyboardModifierMappingSrc = 0x700000050, HIDKeyboardModifierMappingDst = 0x70000006A },
-    { HIDKeyboardModifierMappingSrc = 0x70000004F, HIDKeyboardModifierMappingDst = 0x70000006B },
-    -- OK (Enter) -> F17
-    { HIDKeyboardModifierMappingSrc = 0x700000028, HIDKeyboardModifierMappingDst = 0x70000006C },
-    -- Voice key (0x3E / F5 in Xiaomi remote report) -> F18
-    { HIDKeyboardModifierMappingSrc = 0x70000003E, HIDKeyboardModifierMappingDst = 0x70000006D },
-    -- Menu (0x65) -> F20
-    { HIDKeyboardModifierMappingSrc = 0x700000065, HIDKeyboardModifierMappingDst = 0x70000006F },
-    -- TV (0x35) -> F21
-    { HIDKeyboardModifierMappingSrc = 0x700000035, HIDKeyboardModifierMappingDst = 0x700000070 },
-    -- Volume Up (0x80) -> F22 (isolate from macOS default volume control)
-    { HIDKeyboardModifierMappingSrc = 0x700000080, HIDKeyboardModifierMappingDst = 0x700000071 },
-    -- Volume Down (0x81) -> F23 (isolate from macOS default volume control)
-    { HIDKeyboardModifierMappingSrc = 0x700000081, HIDKeyboardModifierMappingDst = 0x700000072 },
-    -- Home (0x4A) -> F23 (isolate from macOS default Home)
-    { HIDKeyboardModifierMappingSrc = 0x70000004A, HIDKeyboardModifierMappingDst = 0x700000072 },
-    -- Power (0x66) -> F24 (isolate from macOS default sleep)
-    { HIDKeyboardModifierMappingSrc = 0x700000066, HIDKeyboardModifierMappingDst = 0x700000073 },
-    -- Consumer page safety nets (if emitted by certain firmware revisions)
-    { HIDKeyboardModifierMappingSrc = 0xC000000E9, HIDKeyboardModifierMappingDst = 0x700000071 },
-    { HIDKeyboardModifierMappingSrc = 0xC000000EA, HIDKeyboardModifierMappingDst = 0x700000072 },
-    { HIDKeyboardModifierMappingSrc = 0xC00000030, HIDKeyboardModifierMappingDst = 0x700000073 },
-    { HIDKeyboardModifierMappingSrc = 0xC00000223, HIDKeyboardModifierMappingDst = 0x700000072 },
-  }
-
-  local payload = hs.json.encode({ UserKeyMapping = mappings })
+  local payload = hs.json.encode({ UserKeyMapping = hidutilUserKeyMapping() })
   local cmd = string.format("hidutil property --matching '{\"VendorID\":%d,\"ProductID\":%d}' --set '%s'",
-    vendorID, productID, payload)
-  log.i("Applying hidutil mapping for device VID=" .. vendorID .. " PID=" .. productID)
+    vid, pid, payload)
+  log.i("Applying hidutil mapping for device VID=" .. vid .. " PID=" .. pid)
   local out, status = hs.execute(cmd)
   return status == true
+end
+
+local function applyHidutilIfListenerHealthy(vendorID, productID)
+  if not listenerRunning() then
+    return false
+  end
+  return applyHidutil(vendorID, productID)
 end
 
 local function getMatchingVidPid(vendorID, productID)
@@ -542,6 +567,15 @@ local function pushEventToDashboard(keyName, eventType, action, frontApp)
   end
 end
 
+local function stopMouseTimer()
+  if state.mouseTimer ~= nil then
+    pcall(function() state.mouseTimer:stop() end)
+    state.mouseTimer = nil
+  end
+  state.mouseHeldKey = nil
+end
+M.stopMouseTimer = stopMouseTimer
+
 -- Mouse Mode handler (Direction ring moves pointer, OK is left click, Back is right click, Vol+/Vol- is scroll wheel)
 local function handleMouseMovement(keyName)
   local pos = hs.mouse.absolutePosition()
@@ -583,7 +617,20 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     keyName = TRANSIT_KEY_MAP[keyOrCode]
   end
   if not keyName then
-    return false
+    return false  -- real keyboard / login window MUST pass through
+  end
+  if state.sessionLocked then
+    stopMouseTimer()
+    state.activeKeys[keyName] = nil
+    if state.keyTimers[keyName] then
+      state.keyTimers[keyName]:stop()
+      state.keyTimers[keyName] = nil
+    end
+    if state.doubleTapTimers[keyName] then
+      state.doubleTapTimers[keyName]:stop()
+      state.doubleTapTimers[keyName] = nil
+    end
+    return true  -- swallow only known remote transit / IOHID names
   end
 
   updateAppTrack()
@@ -703,6 +750,21 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   end
 end
 
+local loggedSuspectCodes = {}
+local function maybeLogSuspectKeycode(keyCode)
+  if not (keyCode >= 144 and keyCode <= 147) then
+    return
+  end
+  if TRANSIT_KEY_MAP[keyCode] then
+    return
+  end
+  if loggedSuspectCodes[keyCode] then
+    return
+  end
+  loggedSuspectCodes[keyCode] = true
+  logToFile("suspect transit keyCode=%d not in TRANSIT_KEY_MAP", keyCode)
+end
+
 -- Setup Global Event Tap
 local function setupEventTap()
   if state.eventtap then
@@ -720,11 +782,12 @@ local function setupEventTap()
 
     -- If remote_hid_listener is active, it authoritative handles all remote buttons
     -- directly via IOHID (VID/PID isolated). eventtap only needs to consume isolated
-    -- virtual transit keys (F13-F20) so they don't leak into foreground apps.
-    if state.hidTask and state.hidTask:isRunning() then
+    -- virtual transit keys (F13-F24) so they don't leak into foreground apps.
+    if listenerRunning() then
       if TRANSIT_KEY_MAP[keyCode] then
         return true -- eat transit key
       end
+      maybeLogSuspectKeycode(keyCode)
       return false -- pass through Mac physical keyboard keys completely untouched
     end
 
@@ -815,7 +878,7 @@ local function startHidListener()
             elseif event.event == "device_matched" then
               logToFile("Remote control connected via IOHID, applying hidutil mapping...")
               if state.config.device and state.config.device.autoApplyHidutil then
-                applyHidutil(vid, pid)
+                applyHidutilIfListenerHealthy(vid, pid)
               end
               M.refreshDashboardData()
             elseif event.event == "device_removed" then
@@ -873,8 +936,13 @@ local function setupDashboard()
       if payload then
         state.config.device = payload
         saveConfig(state.config)
-        local ok = applyHidutil(payload.vendorID, payload.productID)
         startHidListener()
+        local ok = false
+        if listenerRunning() then
+          ok = applyHidutil(payload.vendorID, payload.productID)
+        else
+          resetHidutil(payload.vendorID, payload.productID)
+        end
         hs.alert.show(ok and "已重新配置 hidutil 隔离与按键监听" or "hidutil 配置失败，请检查 VID/PID", 2)
       end
     elseif action == "reset_hidutil" then
@@ -957,6 +1025,7 @@ function M.refreshDashboardData()
     activeLayer = state.mouseMode and "鼠标模式" or "按键标准模式",
     hidDevices = formattedDevices ~= "" and formattedDevices or "未能识别到外部 HID 设备",
     recentLogs = recentLogLines,
+    listenerRunning = listenerRunning(),
   })
   state.dashboard:evaluateJavaScript(string.format("if (window.onUpdateStatus) { window.onUpdateStatus(%s); }", statusJson))
 end
@@ -1017,14 +1086,41 @@ function M.toggleDashboard()
   end
 end
 
-local function stopMouseTimer()
-  if state.mouseTimer ~= nil then
-    pcall(function() state.mouseTimer:stop() end)
-    state.mouseTimer = nil
-  end
-  state.mouseHeldKey = nil
+
+local function onSessionLock()
+  state.sessionLocked = true
+  stopMouseTimer()
+  state.activeKeys = {}
+  applyHidutil()  -- even if listener is down; remotes become F-keys so eventtap can swallow
 end
-M.stopMouseTimer = stopMouseTimer
+
+local function onSessionUnlock()
+  state.sessionLocked = false
+  if listenerRunning() then
+    applyHidutilIfListenerHealthy()
+  else
+    resetHidutil()  -- avoid dead keys while unlocked
+  end
+end
+
+local function attachLockWatcher()
+  if state.lockWatcher then
+    pcall(function() state.lockWatcher:stop() end)
+  end
+  state.lockWatcher = hs.caffeinate.watcher.new(function(event)
+    local w = hs.caffeinate.watcher
+    if event == w.screensDidLock or event == w.screensaverDidStart then
+      onSessionLock()
+    elseif event == w.screensDidUnlock or event == w.screensaverDidStop then
+      onSessionUnlock()
+    end
+  end)
+  state.lockWatcher:start()
+  local out = hs.execute("/usr/sbin/ioreg -n Root -d 1 -w 0") or ""
+  if out:find('"CGSSessionScreenIsLocked"%s*=%s*Yes') then
+    onSessionLock()  -- already locked at start/reload; watcher will not re-fire
+  end
+end
 
 function M.stop()
   killOwnListener()
@@ -1044,23 +1140,20 @@ function M.stop()
 end
 
 function M.start(options)
-  M.stop()  -- first line; re-entrant. PR 1 MUST keep this.
+  M.stop()  -- still first line
   options = options or {}
   state.config = loadConfig()
-  -- PR 1: do NOT call rebuildBundleMaps / rebuildTransitKeyMap / attachLockWatcher
+  rebuildTransitKeyMap()   -- add in PR 2 (HIDUTIL_MAPPINGS exists)
   setupEventTap()
   resetHidutil()
   startHidListener()
   if state.config.device and state.config.device.autoApplyHidutil then
-    local vid = state.config.device.vendorID
-    local pid = state.config.device.productID
-    if vid and pid and vid > 0 and pid > 0 then
-      applyHidutil(vid, pid)  -- old F-key table until PR 2; residual Home/F23
-    end
+    applyHidutilIfListenerHealthy()  -- replace raw applyHidutil in PR 2
   end
   state.hotkey = hs.hotkey.bind({ "alt", "shift" }, "r", function()
     M.toggleDashboard()
   end)
+  attachLockWatcher()  -- PR 2, AFTER startHidListener; probes ioreg if already locked
   local prevShutdown = hs.shutdownCallback
   hs.shutdownCallback = function()
     M.stop()

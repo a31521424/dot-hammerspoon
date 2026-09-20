@@ -54,6 +54,12 @@ for code, name in pairs(unsafeCodes) do
   local mapped = RC.TRANSIT_KEY_MAP and RC.TRANSIT_KEY_MAP[code]
   assertFalse(mapped, "Standard keyboard key " .. name .. " (keycode " .. code .. ") must NOT be in TRANSIT_KEY_MAP!")
 end
+-- Verify transit map contains tv (144), volume_up (145), volume_down (146), home (80), power (147)
+assertEq(RC.TRANSIT_KEY_MAP[144], "tv", "TRANSIT_KEY_MAP[144] must be tv")
+assertEq(RC.TRANSIT_KEY_MAP[145], "volume_up", "TRANSIT_KEY_MAP[145] must be volume_up")
+assertEq(RC.TRANSIT_KEY_MAP[146], "volume_down", "TRANSIT_KEY_MAP[146] must be volume_down")
+assertEq(RC.TRANSIT_KEY_MAP[80], "home", "TRANSIT_KEY_MAP[80] must be home (F19)")
+assertEq(RC.TRANSIT_KEY_MAP[147], "power", "TRANSIT_KEY_MAP[147] must be power")
 print("  ✓ Native Mac keyboard keycodes are 100% free from hijacking.")
 
 -- Test 2: Key Stroke Parser and Aliases
@@ -99,7 +105,13 @@ for usage, expectedName in pairs(expectedUsages) do
   local decoded = RC.decodeHidUsage(0x07, usage)
   assertEq(decoded, expectedName, string.format("Usage 0x%02X failed to decode", usage))
 end
-print("  ✓ All 13 physical remote usages correctly map to internal keyNames.")
+-- Consumer page usages
+assertEq(RC.decodeHidUsage(0x0C, 0x0224), "back", "Consumer AC Back 0x0224 must decode to back")
+assertEq(RC.decodeHidUsage(0x0C, 0x0223), "home", "Consumer AC Home 0x0223 must decode to home")
+assertEq(RC.decodeHidUsage(0x0C, 0xE9), "volume_up", "Consumer Volume Up 0xE9 must decode to volume_up")
+assertEq(RC.decodeHidUsage(0x0C, 0xEA), "volume_down", "Consumer Volume Down 0xEA must decode to volume_down")
+assertEq(RC.decodeHidUsage(0x0C, 0x30), "power", "Consumer Power 0x30 must decode to power")
+print("  ✓ All 13 physical and consumer remote usages correctly map to internal keyNames.")
 
 -- Test 4: Profile & Key Action Resolution
 print("[Test 4] Per-App Profile Action Resolution check...")
@@ -248,6 +260,52 @@ assertTrue(resetCmd:find('"ProductID":12984', 1, true) ~= nil, "reset command mu
 assertTrue(resetCmd:find('"UserKeyMapping":%[%]') ~= nil or resetCmd:find('"UserKeyMapping":[]', 1, true) ~= nil, "reset command must set empty UserKeyMapping")
 print("  ✓ FIX-05: hidutil reset command correctly scoped with --matching VID/PID.")
 
+-- FIX-03 / FIX-04 / FIX-09: HID table alignment and payload test
+print("[Test 7] HID Mapping Table & Payload validation...")
+local homeDst, volDownDst
+local foundConsumerBack = false
+for _, row in ipairs(RC.HIDUTIL_MAPPINGS or {}) do
+  if row.key == "home" and row.src == 0x70000004A then
+    homeDst = row.dst
+  elseif row.key == "volume_down" and row.src == 0x700000081 then
+    volDownDst = row.dst
+  end
+  if row.src == 0xC00000224 and row.isolationOnly then
+    foundConsumerBack = true
+  end
+end
+assertTrue(homeDst ~= nil and volDownDst ~= nil, "home and volume_down must be in HIDUTIL_MAPPINGS")
+assertTrue(homeDst ~= volDownDst, "Home dst and Volume Down dst must be distinct (FIX-09)")
+assertEq(homeDst, 0x70000006E, "Home dst must be F19 0x70000006E")
+assertTrue(foundConsumerBack, "Consumer AC Back 0xC00000224 must be in HIDUTIL_MAPPINGS with isolationOnly (FIX-04)")
+
+local payload = RC._hidutilApplyPayload and RC._hidutilApplyPayload()
+assertTrue(type(payload) == "string", "apply payload must be a string")
+assertTrue(payload:find("HIDKeyboardModifierMappingSrc", 1, true) ~= nil, "payload must contain HIDKeyboardModifierMappingSrc")
+assertTrue(payload:find("HIDKeyboardModifierMappingDst", 1, true) ~= nil, "payload must contain HIDKeyboardModifierMappingDst")
+assertFalse(payload:find("isolationOnly", 1, true) ~= nil, "payload must NOT contain isolationOnly")
+assertFalse(payload:find('"keycode"', 1, true) ~= nil, "payload must NOT contain keycode")
+assertFalse(payload:find('"key"', 1, true) ~= nil, "payload must NOT contain key")
+
+assertFalse(RC.listenerRunning(), "listenerRunning() must return false when hidTask is nil")
+print("  ✓ HID mapping table, F19 Home, Consumer Back isolation, and payload validated.")
+
+-- FIX-16: Session Lock swallowing & login window pass-through
+print("[Test 8] Session Lock Key Suppression check...")
+executed = {}
+state.sessionLocked = true
+local swallowedDown = RC.testTriggerKey("ok", true, false)
+assertTrue(swallowedDown, "Down event for known key must be swallowed when locked")
+local swallowedUp = RC.testTriggerKey("ok", false, false)
+assertTrue(swallowedUp, "Up event for known key must be swallowed when locked")
+assertEq(#executed, 0, "No actions may be executed while screen is locked")
+
+-- When locked, unknown keys (like physical keyboard Return keycode 36) must pass through
+local returnEaten = RC.testTriggerKey(36, true, false)
+assertFalse(returnEaten, "Keycode 36 (Return) must NOT be swallowed when locked (login window pass-through)")
+state.sessionLocked = false
+print("  ✓ Remote keys strictly swallowed during lock; real keyboard passes through.")
+
 -- Teardown (Algorithm G): stop all timers before clearing mock, so background timers never fire to real desktop
 for _, t in pairs(state.keyTimers or {}) do pcall(function() t:stop() end) end
 state.keyTimers = {}
@@ -261,6 +319,7 @@ if RC.stopMouseTimer then
   RC.stopMouseTimer()
 end
 state.mouseMode = false
+state.sessionLocked = false
 
 -- Restore hook only after timers are stopped
 RC._mockExecuteAction = nil
