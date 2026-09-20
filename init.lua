@@ -6,9 +6,15 @@ hs.dockicon.hide()
 hs.allowAppleScript(true)
 require("hs.ipc")
 
+-- Configure package.path to discover modular packages under ~/.hammerspoon/modules/
+local configDir = hs.configdir or ((os.getenv("HOME") or "") .. "/.hammerspoon")
+package.path = configDir .. "/modules/?.lua;"
+            .. configDir .. "/modules/?/init.lua;"
+            .. package.path
+
 -- Keep this global so Hammerspoon does not garbage-collect the switcher,
 -- window filter, or hotkeys.
-WindowSwitcher = require("window_switcher").start({
+WindowSwitcher = require("modules.window_switcher").start({
   -- Match Windows-style Alt-Tab: minimized windows are valid targets, while
   -- Cmd-H hidden applications stay out of the list.
   includeMinimized = true,
@@ -84,9 +90,14 @@ WindowSwitcher = require("window_switcher").start({
 -- (copy from voice_hotwords.lua.example). Reload Hammerspoon after edits.
 local voiceSecret = {}
 pcall(function()
-  voiceSecret = require("voice_input_secret") or {}
+  voiceSecret = require("modules.voice_input.secret") or {}
 end)
-VoiceInput = require("voice_input").start({
+if not voiceSecret.apiKey then
+  pcall(function()
+    voiceSecret = require("voice_input_secret") or {}
+  end)
+end
+VoiceInput = require("modules.voice_input").start({
   apiKey = voiceSecret.apiKey or os.getenv("HAMMERSPOON_VOICE_DOUBAO_API_KEY"),
   resourceID = "volc.seedasr.auc",
   streamResourceID = "volc.seedasr.sauc.duration",
@@ -96,5 +107,6 @@ VoiceInput = require("voice_input").start({
 -- actions (Termux/Terminal AI agent approvals, browser live reloads, mouse mode),
 -- integrates directly with WindowSwitcher and VoiceInput (F18), and provides
 -- a persistent Control Panel (Dashboard).
-RemoteControl = require("remote_control").start()
+RemoteControl = require("modules.remote_control").start()
+
 

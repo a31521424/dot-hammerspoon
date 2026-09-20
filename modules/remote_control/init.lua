@@ -12,10 +12,32 @@ local M = {}
 
 local log = hs.logger.new("remote-ctrl", "debug")
 local configDir = hs.configdir or ((os.getenv("HOME") or "") .. "/.hammerspoon")
-local CONFIG_FILE = configDir .. "/remote_config.json"
-local EXAMPLE_FILE = configDir .. "/remote_config.json.example"
-local DASHBOARD_HTML = configDir .. "/remote_dashboard.html"
-local DEBUG_LOG = configDir .. "/remote_debug.log"
+local moduleDir = (function()
+  local src = debug.getinfo(1, "S").source
+  if src:sub(1, 1) == "@" then
+    return src:sub(2):match("(.*/)")
+  end
+  return configDir .. "/modules/remote_control/"
+end)() or (configDir .. "/modules/remote_control/")
+
+local function resolveFile(relName, legacyRootName)
+  local localPath = moduleDir .. relName
+  if hs.fs.attributes(localPath, "mode") == "file" then
+    return localPath
+  end
+  if legacyRootName then
+    local rootPath = configDir .. "/" .. legacyRootName
+    if hs.fs.attributes(rootPath, "mode") == "file" then
+      return rootPath
+    end
+  end
+  return localPath
+end
+
+local CONFIG_FILE = resolveFile("config.json", "remote_config.json")
+local EXAMPLE_FILE = resolveFile("config.json.example", "remote_config.json.example")
+local DASHBOARD_HTML = resolveFile("dashboard.html", "remote_dashboard.html")
+local DEBUG_LOG = moduleDir .. "debug.log"
 
 local function logToFile(fmt, ...)
   local msg = string.format(fmt, ...)
@@ -602,17 +624,17 @@ local function startHidListener()
   end
 
   -- Terminate any lingering instances from past sessions/reloads
-  hs.execute("pkill -f remote_hid_listener")
+  hs.execute("pkill -f 'remote_hid_listener|modules/remote_control/listener'")
 
-  local helperBin = configDir .. "/remote_hid_listener"
-  local swiftSrc = configDir .. "/remote_hid_listener.swift"
+  local helperBin = resolveFile("listener", "remote_hid_listener")
+  local swiftSrc = resolveFile("listener.swift", "remote_hid_listener.swift")
   if not fileExists(helperBin) and fileExists(swiftSrc) then
-    log.i("remote_hid_listener binary not found, auto-compiling from Swift source...")
+    log.i("listener binary not found, auto-compiling from Swift source...")
     hs.execute(string.format("swiftc -O '%s' -o '%s'", swiftSrc, helperBin))
   end
 
   if not fileExists(helperBin) then
-    log.w("remote_hid_listener binary not found at " .. helperBin)
+    log.w("listener binary not found at " .. helperBin)
     return
   end
 
@@ -671,7 +693,7 @@ local function stopHidListener()
     state.hidTask:terminate()
     state.hidTask = nil
   end
-  hs.execute("pkill -f remote_hid_listener")
+  hs.execute("pkill -f 'remote_hid_listener|modules/remote_control/listener'")
 end
 
 -- Control Panel Webview Management
@@ -740,7 +762,7 @@ local function setupDashboard()
 
   local htmlContent = readFile(DASHBOARD_HTML)
   if htmlContent then
-    state.dashboard:html(htmlContent, "file://" .. configDir .. "/")
+    state.dashboard:html(htmlContent, "file://" .. moduleDir)
   end
 end
 

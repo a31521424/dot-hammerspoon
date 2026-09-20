@@ -2,8 +2,10 @@
 -- Run via: hs -c 'return dofile(hs.configdir .. "/tests/remote_control_test.lua")'
 
 local root = (hs and hs.configdir) or "."
+package.loaded["modules.remote_control"] = nil
 package.loaded["remote_control"] = nil
-local RC = require("remote_control")
+local ok, RC = pcall(require, "modules.remote_control")
+if not ok then RC = require("remote_control") end
 local state = RC._state
 state.config = RC.loadConfig()
 

@@ -85,7 +85,11 @@ local fakeHS = {
   },
 }
 local env = setmetatable({ hs = fakeHS }, { __index = _G })
-local module = assert(loadfile(root .. "/window_switcher.lua", "t", env))()
+local switcherPath = root .. "/modules/window_switcher/init.lua"
+if hs and hs.fs and hs.fs.attributes(switcherPath, "mode") ~= "file" then
+  switcherPath = root .. "/window_switcher.lua"
+end
+local module = assert(loadfile(switcherPath, "t", env))()
 local controller = module.start()
 local function expectIDs(windows, expected)
   local ids = {}

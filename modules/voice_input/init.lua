@@ -15,8 +15,29 @@ local M = {}
 local log = hs.logger.new("voice-input", "debug")
 local API_KEY_ENV = "HAMMERSPOON_VOICE_DOUBAO_API_KEY"
 local DEBUG = true
-local DEBUG_LOG = (hs.configdir or os.getenv("HOME") .. "/.hammerspoon")
-  .. "/voice_input_debug.log"
+local moduleDir = (function()
+  local src = debug.getinfo(1, "S").source
+  if src:sub(1, 1) == "@" then
+    return src:sub(2):match("(.*/)")
+  end
+  return (hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/modules/voice_input/"
+end)() or ((hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/modules/voice_input/")
+
+local function resolveModuleFile(relName, legacyRootName)
+  local localPath = moduleDir .. relName
+  if hs.fs.attributes(localPath, "mode") == "file" then
+    return localPath
+  end
+  if legacyRootName then
+    local rootPath = (hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/" .. legacyRootName
+    if hs.fs.attributes(rootPath, "mode") == "file" then
+      return rootPath
+    end
+  end
+  return localPath
+end
+
+local DEBUG_LOG = moduleDir .. "debug.log"
 
 local function utf8Chars(text)
   local chars = {}
@@ -109,7 +130,7 @@ local function configDir()
 end
 
 local function defaultLexiconPath()
-  return configDir() .. "/voice_hotwords.lua"
+  return resolveModuleFile("hotwords.lua", "voice_hotwords.lua")
 end
 
 local function copyFile(src, dst)
@@ -135,7 +156,7 @@ local function ensureLexiconFile(path)
   if hs.fs.attributes(path, "mode") == "file" then
     return path
   end
-  local example = configDir() .. "/voice_hotwords.lua.example"
+  local example = resolveModuleFile("hotwords.lua.example", "voice_hotwords.lua.example")
   if hs.fs.attributes(example, "mode") == "file" and copyFile(example, path) then
     return path
   end
@@ -1038,7 +1059,7 @@ function M.start(options)
     streamPython = executable({
       (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/.venv/bin/python",
     }),
-    streamScript = (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/voice_stream.py",
+    streamScript = resolveModuleFile("stream.py", "voice_stream.py"),
     ffmpeg = options.ffmpegPath or executable({ "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" }),
     audioDevice = options.audioDevice,
     audioTask = nil,
