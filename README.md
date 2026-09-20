@@ -98,7 +98,7 @@ swiftc --version
 
 ### 2. 克隆仓库至配置目录
 ```bash
-git clone https://github.com/a31521424/hammerspoon-config.git ~/.hammerspoon
+git clone https://github.com/a31521424/dot-hammerspoon.git ~/.hammerspoon
 ```
 
 ### 3. 配置密钥与首次初始化
