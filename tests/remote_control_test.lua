@@ -92,13 +92,14 @@ local expectedUsages = {
   [0x35] = "tv",
   [0x80] = "volume_up",
   [0x81] = "volume_down",
-  [0x4A] = "power",
+  [0x4A] = "home",
+  [0x66] = "power",
 }
 for usage, expectedName in pairs(expectedUsages) do
   local decoded = RC.decodeHidUsage(0x07, usage)
   assertEq(decoded, expectedName, string.format("Usage 0x%02X failed to decode", usage))
 end
-print("  ✓ All 12 physical remote usages correctly map to internal keyNames.")
+print("  ✓ All 13 physical remote usages correctly map to internal keyNames.")
 
 -- Test 4: Profile & Key Action Resolution
 print("[Test 4] Per-App Profile Action Resolution check...")
@@ -128,6 +129,9 @@ assertEq(actionTVGlobal, "action:toggle_app", "Global TV tap should resolve to t
 
 local actionTVGlobalHold = resolveKeyAction("tv", "hold", "global")
 assertEq(actionTVGlobalHold, "action:toggle_dashboard", "Global TV hold should resolve to toggle_dashboard")
+
+local actionHomeGlobal = resolveKeyAction("home", "tap", "global")
+assertEq(actionHomeGlobal, "action:mission_control", "Global Home tap should resolve to mission_control")
 
 local actionPowerTap = resolveKeyAction("power", "tap", "global")
 assertEq(actionPowerTap, "action:display_sleep", "Global Power tap should resolve to display_sleep")

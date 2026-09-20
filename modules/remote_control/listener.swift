@@ -64,7 +64,8 @@ let valueCb: IOHIDValueCallback = { _, _, _, value in
         case 0x35: keyName = "tv"
         case 0x80: keyName = "volume_up"
         case 0x81: keyName = "volume_down"
-        case 0x4A: keyName = "power"
+        case 0x4A: keyName = "home"
+        case 0x66: keyName = "power"
         default: break
         }
     } else if usagePage == 0x0C {

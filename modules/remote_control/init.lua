@@ -201,12 +201,15 @@ local function applyHidutil(vendorID, productID)
     { HIDKeyboardModifierMappingSrc = 0x700000080, HIDKeyboardModifierMappingDst = 0x700000071 },
     -- Volume Down (0x81) -> F23 (isolate from macOS default volume control)
     { HIDKeyboardModifierMappingSrc = 0x700000081, HIDKeyboardModifierMappingDst = 0x700000072 },
-    -- Power (0x4A) -> F24 (isolate from macOS default sleep)
-    { HIDKeyboardModifierMappingSrc = 0x70000004A, HIDKeyboardModifierMappingDst = 0x700000073 },
+    -- Home (0x4A) -> F23 (isolate from macOS default Home)
+    { HIDKeyboardModifierMappingSrc = 0x70000004A, HIDKeyboardModifierMappingDst = 0x700000072 },
+    -- Power (0x66) -> F24 (isolate from macOS default sleep)
+    { HIDKeyboardModifierMappingSrc = 0x700000066, HIDKeyboardModifierMappingDst = 0x700000073 },
     -- Consumer page safety nets (if emitted by certain firmware revisions)
     { HIDKeyboardModifierMappingSrc = 0xC000000E9, HIDKeyboardModifierMappingDst = 0x700000071 },
     { HIDKeyboardModifierMappingSrc = 0xC000000EA, HIDKeyboardModifierMappingDst = 0x700000072 },
     { HIDKeyboardModifierMappingSrc = 0xC00000030, HIDKeyboardModifierMappingDst = 0x700000073 },
+    { HIDKeyboardModifierMappingSrc = 0xC00000223, HIDKeyboardModifierMappingDst = 0x700000072 },
   }
 
   local payload = hs.json.encode({ UserKeyMapping = mappings })
@@ -939,7 +942,8 @@ M.decodeHidUsage = function(page, usage)
     local map = {
       [0x52] = "up", [0x51] = "down", [0x50] = "left", [0x4F] = "right",
       [0x28] = "ok", [0x3E] = "voice", [0xF1] = "back", [0x65] = "menu",
-      [0x35] = "tv", [0x80] = "volume_up", [0x81] = "volume_down", [0x4A] = "power"
+      [0x35] = "tv", [0x80] = "volume_up", [0x81] = "volume_down",
+      [0x4A] = "home", [0x66] = "power"
     }
     return map[usage]
   elseif page == 0x0C then
