@@ -91,3 +91,10 @@ VoiceInput = require("voice_input").start({
   resourceID = "volc.seedasr.auc",
   streamResourceID = "volc.seedasr.sauc.duration",
 })
+
+-- Remote Control Engine: maps Bluetooth/HID remote hardware keys to Web development
+-- actions (Termux/Terminal AI agent approvals, browser live reloads, mouse mode),
+-- integrates directly with WindowSwitcher and VoiceInput (F18), and provides
+-- a persistent Control Panel (Dashboard).
+RemoteControl = require("remote_control").start()
+

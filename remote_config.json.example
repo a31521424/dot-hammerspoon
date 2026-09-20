@@ -1,0 +1,87 @@
+{
+  "device": {
+    "vendorID": 10007,
+    "productID": 12984,
+    "name": "Xiaomi Bluetooth Remote 2 Pro",
+    "autoApplyHidutil": true
+  },
+  "settings": {
+    "holdThresholdMs": 350,
+    "doubleClickIntervalMs": 250,
+    "mouseSpeed": 14,
+    "mouseAcceleration": 1.2
+  },
+  "profiles": {
+    "global": {
+      "name": "全局默认",
+      "keys": {
+        "voice": { "tap": "action:voice_input", "hold": "action:voice_input" },
+        "menu": { "tap": "action:window_switcher", "hold": "action:escape_layer" },
+        "tv": { "tap": "action:toggle_app", "hold": "action:toggle_dashboard" },
+        "ok": { "tap": "key:return" },
+        "back": { "tap": "key:delete" },
+        "up": { "tap": "key:up", "hold": "key:up" },
+        "down": { "tap": "key:down", "hold": "key:down" },
+        "left": { "tap": "key:left", "hold": "key:left" },
+        "right": { "tap": "key:right", "hold": "key:right" },
+        "volume_up": { "tap": "key:volume_up" },
+        "volume_down": { "tap": "key:volume_down" },
+        "home": { "tap": "action:mission_control" },
+        "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
+      }
+    },
+    "terminal": {
+      "name": "终端 / Termux 开发模式",
+      "bundleIDs": [
+        "com.mitchellh.ghostty",
+        "com.googlecode.iterm2",
+        "com.apple.Terminal",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+        "com.github.wez.wezterm",
+        "dev.warp.Warp-GDK"
+      ],
+      "keys": {
+        "voice": { "tap": "action:voice_input", "hold": "action:voice_input" },
+        "menu": { "tap": "action:window_switcher", "hold": "action:escape_layer" },
+        "tv": { "tap": "action:switch_to_browser" },
+        "ok": { "tap": "macro:approve_agent", "hold": "macro:restart_dev_server" },
+        "back": { "tap": "key:delete", "hold": "key:ctrl+c" },
+        "up": { "tap": "key:up", "hold": "key:up" },
+        "down": { "tap": "key:down", "hold": "key:down" },
+        "left": { "tap": "key:alt+left" },
+        "right": { "tap": "key:alt+right" },
+        "volume_up": { "tap": "macro:tmux_next_window" },
+        "volume_down": { "tap": "macro:tmux_prev_window" },
+        "home": { "tap": "action:mission_control" },
+        "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
+      }
+    },
+    "browser": {
+      "name": "Web 浏览器调试模式",
+      "bundleIDs": [
+        "com.google.Chrome",
+        "company.thebrowser.Arc",
+        "com.apple.Safari",
+        "org.mozilla.firefox",
+        "com.microsoft.edgemac",
+        "com.brave.Browser"
+      ],
+      "keys": {
+        "voice": { "tap": "action:voice_input", "hold": "action:voice_input" },
+        "menu": { "tap": "action:window_switcher", "hold": "action:escape_layer" },
+        "tv": { "tap": "action:switch_to_terminal" },
+        "ok": { "tap": "key:return", "hold": "key:alt+cmd+i" },
+        "back": { "tap": "key:cmd+[", "hold": "key:shift+cmd+r" },
+        "up": { "tap": "key:up", "hold": "key:pageup" },
+        "down": { "tap": "key:down", "hold": "key:pagedown" },
+        "left": { "tap": "key:alt+cmd+left" },
+        "right": { "tap": "key:alt+cmd+right" },
+        "volume_up": { "tap": "key:ctrl+tab" },
+        "volume_down": { "tap": "key:ctrl+shift+tab" },
+        "home": { "tap": "action:mission_control" },
+        "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
+      }
+    }
+  }
+}

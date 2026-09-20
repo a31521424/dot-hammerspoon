@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>遥控器控制中心 - Remote Control Center</title>
+  <style>
+    :root {
+      --bg: #14171c;
+      --card-bg: #1c2128;
+      --card-border: #2d333b;
+      --text: #adbac7;
+      --text-bright: #f0f6fc;
+      --accent: #388bfd;
+      --accent-hover: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+      --purple: #bc8cff;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 18px 24px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+    }
+
+    /* Top Bar */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 14px;
+    }
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header-title h1 {
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--text-bright);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 500;
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--success);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .badge.listening {
+      background: rgba(56, 139, 253, 0.15);
+      color: var(--accent);
+      border-color: rgba(56, 139, 253, 0.3);
+    }
+    .badge.disconnected {
+      background: rgba(248, 81, 73, 0.15);
+      color: var(--danger);
+      border-color: rgba(248, 81, 73, 0.3);
+    }
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .hint-text {
+      font-size: 11px;
+      color: #768390;
+    }
+    .btn {
+      padding: 5px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      color: var(--text-bright);
+      font-size: 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s;
+    }
+    .btn:hover {
+      background: #262c36;
+      border-color: #444c56;
+    }
+    .btn-primary {
+      background: #238636;
+      border-color: #2ea043;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #2ea043;
+    }
+    .btn-danger {
+      background: rgba(248, 81, 73, 0.15);
+      border-color: rgba(248, 81, 73, 0.4);
+      color: var(--danger);
+    }
+    .btn-danger:hover {
+      background: rgba(248, 81, 73, 0.25);
+    }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 14px;
+      background: #0d1117;
+      padding: 3px;
+      border-radius: var(--radius);
+      width: fit-content;
+      border: 1px solid var(--card-border);
+    }
+    .tab-item {
+      padding: 5px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text);
+      font-weight: 500;
+      transition: all 0.15s;
+    }
+    .tab-item.active {
+      background: var(--card-bg);
+      color: var(--text-bright);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+
+    /* Content Area */
+    .tab-content {
+      flex: 1;
+      overflow-y: auto;
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-bright);
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Key Monitor Box */
+    .monitor-box {
+      background: #0d1117;
+      border: 1px dashed var(--card-border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+      transition: all 0.15s ease-in-out;
+    }
+    .monitor-box.active {
+      border-color: var(--accent);
+      background: rgba(56, 139, 253, 0.12);
+      box-shadow: 0 0 16px rgba(56, 139, 253, 0.25);
+    }
+    .monitor-key {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .key-badge {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px;
+      font-weight: 600;
+      background: #2d333b;
+      color: var(--accent-hover);
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid #444c56;
+      min-width: 60px;
+      text-align: center;
+    }
+    .monitor-action {
+      color: var(--success);
+      font-weight: 500;
+    }
+
+    /* Form rows */
+    .form-row {
+      display: flex;
+      align-items: center;
+      margin-bottom: 10px;
+      gap: 12px;
+    }
+    .form-label {
+      width: 130px;
+      font-size: 12px;
+      color: var(--text);
+    }
+    .form-input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid var(--card-border);
+      color: var(--text-bright);
+      padding: 5px 10px;
+      border-radius: var(--radius);
+      font-size: 12px;
+      outline: none;
+    }
+    .form-input:focus {
+      border-color: var(--accent);
+    }
+
+    /* Tables */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    th {
+      color: #768390;
+      font-weight: 500;
+    }
+    td select, td input {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid var(--card-border);
+      color: var(--text-bright);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      outline: none;
+    }
+
+    /* Log Stream */
+    .log-list {
+      max-height: 240px;
+      overflow-y: auto;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      background: #0d1117;
+      border-radius: var(--radius);
+      padding: 8px 12px;
+    }
+    .log-item {
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      display: flex;
+      gap: 10px;
+    }
+    .log-time { color: #636e7b; }
+    .log-key { color: var(--purple); font-weight: 600; }
+    .log-action { color: var(--accent-hover); }
+    .log-app { color: var(--text); }
+  </style>
+</head>
+<body>
+
+  <!-- Top Bar -->
+  <div class="header">
+    <div class="header-title">
+      <h1>遥控器控制中心</h1>
+      <span class="badge" id="statusBadge"><span class="badge-dot"></span> 后台服务运行中</span>
+    </div>
+    <div class="header-actions">
+      <span class="hint-text">按 Esc 或点击关闭可隐藏面板，后台服务持续常驻</span>
+      <button class="btn" onclick="callLua('hide')">隐藏控制台 (Esc)</button>
+    </div>
+  </div>
+
+  <!-- 实时按键捕捉监视器 (常驻顶部，任何 Tab 切换均可见) -->
+  <div class="monitor-box" id="globalMonitorBox">
+    <div class="monitor-key">
+      <span class="key-badge" id="monitorKey">--</span>
+      <div>
+        <div style="font-weight: 600; color: var(--text-bright);" id="monitorKeyName">等待按键触发...</div>
+        <div class="hint-text" id="monitorKeyType">当前模式: 等待按键输入</div>
+      </div>
+    </div>
+    <div class="monitor-action" id="monitorAction">动作: --</div>
+  </div>
+
+  <!-- Tabs Navigation -->
+  <div class="tabs">
+    <div class="tab-item active" onclick="switchTab(this, 'device')">设备与连接</div>
+    <div class="tab-item" onclick="switchTab(this, 'mappings')">键位映射方案</div>
+    <div class="tab-item" onclick="switchTab(this, 'logs')">运行状态与日志</div>
+  </div>
+
+  <!-- Tab 1: 设备与连接 -->
+  <div class="tab-content active" id="tab-device">
+    <div class="card">
+      <div class="card-title">遥控器设备识别与 hidutil 隔离</div>
+      <div class="form-row">
+        <div class="form-label">遥控器设备名</div>
+        <input class="form-input" id="devName" placeholder="例如：Xiaomi Bluetooth Remote 2 Pro" />
+      </div>
+      <div class="form-row">
+        <div class="form-label">Vendor ID (VID)</div>
+        <input class="form-input" id="devVID" placeholder="十进制或十六进制，如 10007 或 0x2717" />
+      </div>
+      <div class="form-row">
+        <div class="form-label">Product ID (PID)</div>
+        <input class="form-input" id="devPID" placeholder="十进制或十六进制，如 12984 或 0x32B8" />
+      </div>
+      <div style="display: flex; gap: 10px; margin-top: 14px;">
+        <button class="btn btn-primary" onclick="applyDeviceSettings()">应用配置并重绑 hidutil 隔离</button>
+        <button class="btn" onclick="callLua('detect_devices')">扫描当前系统已连接 HID 设备</button>
+        <button class="btn btn-danger" onclick="callLua('reset_hidutil')">清空 hidutil 映射 (应急还原)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">系统当前检测到的外设列表</div>
+      <div id="hidDeviceList" style="max-height: 140px; overflow-y: auto; font-family: monospace; font-size: 11px; background: #0d1117; padding: 8px; border-radius: var(--radius);">
+        正在读取系统 HID 列表...
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 2: 键位映射方案 -->
+  <div class="tab-content" id="tab-mappings">
+    <div class="card">
+      <div class="card-title">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span>当前场景 Profile：</span>
+          <select id="profileSelect" onchange="renderKeyTable()" style="background: #0d1117; color: #fff; border: 1px solid var(--card-border); padding: 4px 8px; border-radius: 4px;">
+            <option value="global">全局通用模式 (Global)</option>
+            <option value="terminal">终端开发模式 (Termux / Ghostty / iTerm / AI Agent)</option>
+            <option value="browser">浏览器调试模式 (Web 预览 / DevTools)</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="saveMappings()">保存当前映射配置</button>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 110px;">物理键</th>
+            <th>短按 (Tap)</th>
+            <th>长按 (Hold, >350ms)</th>
+          </tr>
+        </thead>
+        <tbody id="mappingTableBody">
+          <!-- 动态注入 -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tab 3: 运行状态与日志 -->
+  <div class="tab-content" id="tab-logs">
+    <div class="card">
+      <div class="card-title">
+        <span>当前系统运行时状态</span>
+        <button class="btn" onclick="callLua('refresh_status')">刷新状态</button>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 12px;">
+        <div>当前前台应用: <strong id="frontApp" style="color: var(--accent-hover);">--</strong></div>
+        <div>当前活跃模式: <strong id="activeLayer" style="color: var(--success);">标准模式</strong></div>
+        <div>语音服务状态: <strong id="voiceStatus" style="color: var(--purple);">正常待机 (F18 握手可用)</strong></div>
+        <div>窗口切换器状态: <strong style="color: var(--text-bright);">已集成 window_switcher</strong></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>按键触发与动作派发流 (实时)</span>
+        <button class="btn" onclick="clearLogs()">清空日志</button>
+      </div>
+      <div class="log-list" id="logList">
+        <div class="log-item"><span class="log-time">--:--:--</span> 等待遥控器信号...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentConfig = {};
+    let actionOptions = [
+      { val: "action:voice_input", label: "🎤 触发流式语音输入 (Hold to talk)" },
+      { val: "action:window_switcher", label: "≡ 唤起垂直 Alt-Tab 窗口选择器" },
+      { val: "action:toggle_app", label: "📺 极速穿梭 (终端 ↔ 浏览器秒切)" },
+      { val: "action:switch_to_browser", label: "🌐 一键切换并聚焦浏览器" },
+      { val: "action:switch_to_terminal", label: "💻 一键切换并聚焦终端" },
+      { val: "action:toggle_mouse_mode", label: "🖱️ 切换鼠标模式 (方向环移指针)" },
+      { val: "action:mission_control", label: "⌂ 调度中心 (Mission Control)" },
+      { val: "action:display_sleep", label: "⏻ 显示器休眠" },
+      { val: "action:escape_layer", label: "🚨 逃生键 (退出所有模式/关闭浮层)" },
+      { val: "macro:approve_agent", label: "⚡ AI Agent 批准 (发送 y + Enter)" },
+      { val: "macro:restart_dev_server", label: "⚡ 重启服务 (Ctrl+C -> 上箭头 -> Enter)" },
+      { val: "macro:tmux_next_window", label: "⚡ tmux 下一个窗口 (Ctrl+B -> n)" },
+      { val: "macro:tmux_prev_window", label: "⚡ tmux 上一个窗口 (Ctrl+B -> p)" },
+      { val: "key:return", label: "按键: 回车 (Return)" },
+      { val: "key:delete", label: "按键: 退格 (Backspace)" },
+      { val: "key:ctrl+c", label: "按键: 中断命令 (Ctrl+C)" },
+      { val: "key:ctrl+l", label: "按键: 终端清屏 (Ctrl+L)" },
+      { val: "key:shift+cmd+r", label: "按键: 强制硬刷新 (Cmd+Shift+R)" },
+      { val: "key:alt+cmd+i", label: "按键: 开启/关闭 DevTools (Opt+Cmd+I)" },
+      { val: "key:cmd+[", label: "按键: 网页后退上一页 (Cmd+[)" },
+      { val: "key:ctrl+tab", label: "按键: 下一个标签页 (Ctrl+Tab)" },
+      { val: "key:ctrl+shift+tab", label: "按键: 上一个标签页 (Ctrl+Shift+Tab)" },
+      { val: "key:up", label: "按键: 方向 ↑ (翻命令/上滚)" },
+      { val: "key:down", label: "按键: 方向 ↓ (翻命令/下滚)" },
+      { val: "key:left", label: "按键: 方向 ← (向左跳词)" },
+      { val: "key:right", label: "按键: 方向 → (向右跳词)" },
+      { val: "key:pageup", label: "按键: 上翻页 (Page Up)" },
+      { val: "key:pagedown", label: "按键: 下翻页 (Page Down)" },
+      { val: "key:volume_up", label: "按键: 系统音量 +" },
+      { val: "key:volume_down", label: "按键: 系统音量 -" }
+    ];
+
+    const keyLabels = {
+      voice: "🎤 语音键",
+      ok: "⭕ OK 键",
+      back: "< 返回键",
+      menu: "≡ 菜单键",
+      tv: "📺 TV 键",
+      up: "↑ 方向上",
+      down: "↓ 方向下",
+      left: "← 方向左",
+      right: "→ 方向右",
+      volume_up: "🔊 音量 +",
+      volume_down: "🔉 音量 -",
+      home: "⌂ 主页键",
+      power: "⏻ 电源键"
+    };
+
+    function switchTab(el, tabId) {
+      document.querySelectorAll('.tab-item').forEach(item => item.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+      if (el && el.classList) {
+        el.classList.add('active');
+      }
+      const target = document.getElementById('tab-' + tabId);
+      if (target) {
+        target.classList.add('active');
+      }
+    }
+
+    function callLua(action, payload = {}) {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.remoteControl) {
+        window.webkit.messageHandlers.remoteControl.postMessage({ action, payload });
+      }
+    }
+
+    // 由 Lua 端注入或回传全量配置
+    function onReceiveConfig(config) {
+      currentConfig = config;
+      if (config.device) {
+        document.getElementById('devName').value = config.device.name || '';
+        document.getElementById('devVID').value = config.device.vendorID || '';
+        document.getElementById('devPID').value = config.device.productID || '';
+      }
+      renderKeyTable();
+    }
+
+    function renderKeyTable() {
+      const profile = document.getElementById('profileSelect').value;
+      const tbody = document.getElementById('mappingTableBody');
+      tbody.innerHTML = '';
+      const profileData = (currentConfig.profiles && currentConfig.profiles[profile]) || {};
+      const keys = profileData.keys || {};
+
+      for (let k in keyLabels) {
+        const row = document.createElement('tr');
+        const currentTap = keys[k] ? (keys[k].tap || '') : '';
+        const currentHold = keys[k] ? (keys[k].hold || '') : '';
+
+        row.innerHTML = `
+          <td><strong>${keyLabels[k]}</strong></td>
+          <td>${buildSelect(k, 'tap', currentTap)}</td>
+          <td>${buildSelect(k, 'hold', currentHold)}</td>
+        `;
+        tbody.appendChild(row);
+      }
+    }
+
+    function buildSelect(key, type, currentVal) {
+      let html = `<select onchange="updateKeyBinding('${key}', '${type}', this.value)">`;
+      html += `<option value="">-- 无操作 (None) --</option>`;
+      actionOptions.forEach(opt => {
+        const sel = opt.val === currentVal ? 'selected' : '';
+        html += `<option value="${opt.val}" ${sel}>${opt.label}</option>`;
+      });
+      html += `</select>`;
+      return html;
+    }
+
+    function updateKeyBinding(key, type, val) {
+      const profile = document.getElementById('profileSelect').value;
+      if (!currentConfig.profiles[profile]) currentConfig.profiles[profile] = { keys: {} };
+      if (!currentConfig.profiles[profile].keys[key]) currentConfig.profiles[profile].keys[key] = {};
+      currentConfig.profiles[profile].keys[key][type] = val;
+    }
+
+    function saveMappings() {
+      callLua('save_config', currentConfig);
+    }
+
+    function applyDeviceSettings() {
+      if (!currentConfig.device) currentConfig.device = {};
+      currentConfig.device.name = document.getElementById('devName').value;
+      currentConfig.device.vendorID = parseInt(document.getElementById('devVID').value) || 0;
+      currentConfig.device.productID = parseInt(document.getElementById('devPID').value) || 0;
+      callLua('apply_device', currentConfig.device);
+    }
+
+    // 由 Lua 端推送的实时按键和事件通知
+    let activeKeyClearTimer = null;
+    function onRemoteKeyEvent(event) {
+      document.getElementById('monitorKey').innerText = event.keyName || event.keyCode;
+      document.getElementById('monitorKeyName').innerText = keyLabels[event.keyName] || event.keyName;
+      document.getElementById('monitorKeyType').innerText = '当前事件: ' + (event.eventType || 'tap');
+      document.getElementById('monitorAction').innerText = '动作: ' + (event.action || '--');
+
+      const box = document.getElementById('globalMonitorBox');
+      if (box) {
+        if (event.eventType === 'down') {
+          box.classList.add('active');
+          if (activeKeyClearTimer) clearTimeout(activeKeyClearTimer);
+        } else {
+          if (activeKeyClearTimer) clearTimeout(activeKeyClearTimer);
+          activeKeyClearTimer = setTimeout(() => {
+            box.classList.remove('active');
+          }, 200);
+        }
+      }
+
+      const logList = document.getElementById('logList');
+      const item = document.createElement('div');
+      item.className = 'log-item';
+      item.innerHTML = `
+        <span class="log-time">${new Date().toLocaleTimeString()}</span>
+        <span class="log-key">[${event.keyName} | ${event.eventType}]</span>
+        <span class="log-action">${event.action || '无动作'}</span>
+        <span class="log-app">(${event.frontApp || '未知应用'})</span>
+      `;
+      logList.insertBefore(item, logList.firstChild);
+      if (logList.children.length > 30) logList.removeChild(logList.lastChild);
+    }
+
+    function onUpdateStatus(status) {
+      if (status.frontApp) document.getElementById('frontApp').innerText = status.frontApp;
+      if (status.activeLayer) document.getElementById('activeLayer').innerText = status.activeLayer;
+      if (status.hidDevices) document.getElementById('hidDeviceList').innerHTML = status.hidDevices;
+      if (status.recentLogs && status.recentLogs.length > 0) {
+        const logList = document.getElementById('logList');
+        if (logList.children.length <= 1 && logList.innerText.includes('等待遥控器信号')) {
+          logList.innerHTML = '';
+          status.recentLogs.forEach(line => {
+            const item = document.createElement('div');
+            item.className = 'log-item';
+            item.style.fontFamily = 'monospace';
+            item.style.fontSize = '11px';
+            item.innerText = line;
+            logList.appendChild(item);
+          });
+        }
+      }
+    }
+
+    function clearLogs() {
+      document.getElementById('logList').innerHTML = '';
+    }
+
+    // 通知 Lua 端网页已加载完毕，准备接收初始数据
+    window.onload = function() {
+      callLua('ready');
+    };
+  </script>
+</body>
+</html>
