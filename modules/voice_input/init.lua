@@ -1222,6 +1222,7 @@ function M.start(options)
     daemonTask = nil,
     daemonSocketPath = "/tmp/hammerspoon_voice_stream.sock",
     streamSocket = nil,
+    didAlertFlashFallback = false,
     ui = makeUI(),
   }
 
@@ -1751,8 +1752,16 @@ function M.start(options)
     end
   end
 
+  local function alertFlashFallbackOnce()
+    if not state.didAlertFlashFallback then
+      state.didAlertFlashFallback = true
+      hs.alert.show("流式 ASR 环境未就绪，已自动降级为 Flash 识别模式", 2.5)
+    end
+  end
+
   local function ensureDaemon()
     if state.streamPython == nil or hs.fs.attributes(state.streamScript, "mode") ~= "file" then
+      alertFlashFallbackOnce()
       return
     end
     if state.daemonTask ~= nil and state.daemonTask:isRunning() then
@@ -1784,6 +1793,7 @@ function M.start(options)
   local function startStream(gen)
     if state.streamPython == nil or hs.fs.attributes(state.streamScript, "mode") ~= "file" then
       dbg("stream unavailable python=%s", tostring(state.streamPython))
+      alertFlashFallbackOnce()
       startFlashLive()
       return
     end

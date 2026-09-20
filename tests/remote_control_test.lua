@@ -359,6 +359,37 @@ state.config.profiles.global.keys.voice = savedVoiceCfg
 state._testBundleID = nil
 print("  ✓ Remapped voice key follows normal tap lifecycle.")
 
+-- FIX-16: dangerousMacros flag
+print("[Test 11] dangerousMacros flag check...")
+local origKeyStroke = hs.eventtap.keyStroke
+local strokes = {}
+hs.eventtap.keyStroke = function(mods, key)
+  table.insert(strokes, { mods = mods, key = key })
+end
+
+RC._mockExecuteAction = nil
+state.config.settings = state.config.settings or {}
+
+-- When dangerousMacros is false, macro:approve_agent and macro:restart_dev_server must be no-ops
+state.config.settings.dangerousMacros = false
+strokes = {}
+RC._executeAction("macro:approve_agent", "ok", "tap")
+assertEq(#strokes, 0, "macro:approve_agent must be no-op when dangerousMacros == false")
+
+RC._executeAction("macro:restart_dev_server", "ok", "hold")
+assertEq(#strokes, 0, "macro:restart_dev_server must be no-op when dangerousMacros == false")
+
+-- When dangerousMacros is true (or default), macro:approve_agent executes
+state.config.settings.dangerousMacros = true
+strokes = {}
+RC._executeAction("macro:approve_agent", "ok", "tap")
+assertEq(#strokes, 1, "macro:approve_agent must execute when dangerousMacros == true")
+assertEq(strokes[1].key, "y", "macro:approve_agent should press y")
+
+hs.eventtap.keyStroke = origKeyStroke
+RC._mockExecuteAction = mockExecute
+print("  ✓ dangerousMacros flag properly suppresses agent approval and server restart macros.")
+
 -- Teardown (Algorithm G): stop all timers before clearing mock, so background timers never fire to real desktop
 for _, t in pairs(state.keyTimers or {}) do pcall(function() t:stop() end) end
 state.keyTimers = {}

@@ -13,6 +13,7 @@
 ```text
 ~/.hammerspoon/
 ├── init.lua                           # 入口文件：包路径注入与模块加载
+├── requirements.txt                   # 流式语音 WebSocket 依赖
 ├── README.md                          # 配置与使用说明
 ├── LICENSE                            # MIT 开源许可证
 ├── .gitignore                         # 敏感信息与临时文件过滤
@@ -65,6 +66,7 @@
 > - **0xF1 限制**：Back 的键盘页 `0xF1` 只能靠 IOHID 监听；hidutil 无法重映射该 usage。若 listener 未运行，Back 键不保证隔离。
 > - **Listener 失败降级**：解锁状态下若 listener 未运行，系统不会应用 hidutil 映射（或自动重置本设备），遥控器退回原生多媒体键，避免音量/Home/电源成为死键；未运行时不声称已隔离。
 > - **锁屏残留风险**：Mac 锁屏或屏保期间，系统会自动丢弃全部遥控 HID 事件。但在 hidutil 尚未生效的瞬间、`0xF1` Back、或 hidutil 失败时，原生遥控键仍可能打进锁屏密码框。
+> - **特权输入与危险宏风险**：遥控器属于特权输入设备。任何人拿到已配对的蓝牙遥控器，都可在 macOS 解锁会话下通过终端 OK 键批准 Agent 操作 (`macro:approve_agent`) 或重启开发服务器。如需防范此风险，可在配置中将 `settings.dangerousMacros` 设为 `false` 以全局禁用上述危险宏。
 
 ---
 
@@ -75,6 +77,10 @@
 ```bash
 brew install --cask hammerspoon
 brew install ffmpeg
+
+# 创建流式语音识别使用的 Python 虚拟环境并安装依赖
+python3 -m venv ~/.hammerspoon/.venv
+~/.hammerspoon/.venv/bin/pip install -r ~/.hammerspoon/requirements.txt
 ```
 
 ### 2. 克隆配置
@@ -88,8 +94,9 @@ git clone https://github.com/a31521424/dot-hammerspoon.git ~/.hammerspoon
 1. **语音识别 API Key**：
    ```bash
    cp ~/.hammerspoon/modules/voice_input/secret.lua.example ~/.hammerspoon/modules/voice_input/secret.lua
-   # 编辑填入火山引擎豆包语音识别的 appId、accessToken、cluster
+   # 编辑填入火山引擎豆包语音识别的 apiKey
    ```
+   *注意：macOS GUI 启动的 Hammerspoon 不会加载 `~/.zshrc`，因此请直接在 `modules/voice_input/secret.lua`（或兼容别名 `~/.hammerspoon/voice_input_secret.lua`）中填写 `apiKey`，不要依赖在 `~/.zshrc` 中 export；环境变量仅在终端执行 `hs` 启动时有效。*
 
 2. **编译硬件监听器**（首次加载时脚本亦会自动触发编译）：
    ```bash

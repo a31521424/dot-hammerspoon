@@ -9,7 +9,8 @@
     "holdThresholdMs": 350,
     "doubleClickIntervalMs": 250,
     "mouseSpeed": 14,
-    "mouseAcceleration": 1.2
+    "mouseAcceleration": 1.2,
+    "dangerousMacros": true
   },
   "profiles": {
     "global": {

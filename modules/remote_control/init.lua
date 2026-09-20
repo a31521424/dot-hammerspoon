@@ -515,6 +515,12 @@ local function executeAction(actionStr, keyName, eventType)
 
   -- 7. Macro actions
   if actionStr == "macro:approve_agent" then
+    local settings = (state.config and state.config.settings) or {}
+    if settings.dangerousMacros == false then
+      logToFile("macro:approve_agent skipped because dangerousMacros is false")
+      hs.alert.show("已禁用危险宏 (dangerousMacros=false)", 1)
+      return
+    end
     hs.eventtap.keyStroke({}, "y", 10000)
     hs.timer.doAfter(0.04, function()
       hs.eventtap.keyStroke({}, "return", 10000)
@@ -523,6 +529,12 @@ local function executeAction(actionStr, keyName, eventType)
   end
 
   if actionStr == "macro:restart_dev_server" then
+    local settings = (state.config and state.config.settings) or {}
+    if settings.dangerousMacros == false then
+      logToFile("macro:restart_dev_server skipped because dangerousMacros is false")
+      hs.alert.show("已禁用危险宏 (dangerousMacros=false)", 1)
+      return
+    end
     hs.eventtap.keyStroke({ "ctrl" }, "c", 10000)
     hs.timer.doAfter(0.08, function()
       hs.eventtap.keyStroke({}, "up", 10000)
@@ -1369,5 +1381,6 @@ end
 M.currentProfile = currentProfile
 M.rebuildBundleMaps = rebuildBundleMaps
 M.stopMouseTimer = stopMouseTimer
+M._executeAction = executeAction
 
 return M

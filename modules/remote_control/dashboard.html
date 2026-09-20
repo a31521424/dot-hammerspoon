@@ -590,10 +590,10 @@
     // 由 Lua 端推送的实时按键和事件通知
     let activeKeyClearTimer = null;
     function onRemoteKeyEvent(event) {
-      document.getElementById('monitorKey').innerText = event.keyName || event.keyCode;
-      document.getElementById('monitorKeyName').innerText = keyLabels[event.keyName] || event.keyName;
-      document.getElementById('monitorKeyType').innerText = '当前事件: ' + (event.eventType || 'tap');
-      document.getElementById('monitorAction').innerText = '动作: ' + (event.action || '--');
+      document.getElementById('monitorKey').textContent = event.keyName || event.keyCode;
+      document.getElementById('monitorKeyName').textContent = keyLabels[event.keyName] || event.keyName;
+      document.getElementById('monitorKeyType').textContent = '当前事件: ' + (event.eventType || 'tap');
+      document.getElementById('monitorAction').textContent = '动作: ' + (event.action || '--');
 
       const box = document.getElementById('globalMonitorBox');
       if (box) {
@@ -611,12 +611,31 @@
       const logList = document.getElementById('logList');
       const item = document.createElement('div');
       item.className = 'log-item';
-      item.innerHTML = `
-        <span class="log-time">${new Date().toLocaleTimeString()}</span>
-        <span class="log-key">[${event.keyName} | ${event.eventType}]</span>
-        <span class="log-action">${event.action || '无动作'}</span>
-        <span class="log-app">(${event.frontApp || '未知应用'})</span>
-      `;
+
+      const spanTime = document.createElement('span');
+      spanTime.className = 'log-time';
+      spanTime.textContent = new Date().toLocaleTimeString();
+
+      const spanKey = document.createElement('span');
+      spanKey.className = 'log-key';
+      spanKey.textContent = '[' + (event.keyName || '') + ' | ' + (event.eventType || '') + ']';
+
+      const spanAction = document.createElement('span');
+      spanAction.className = 'log-action';
+      spanAction.textContent = event.action || '无动作';
+
+      const spanApp = document.createElement('span');
+      spanApp.className = 'log-app';
+      spanApp.textContent = '(' + (event.frontApp || '未知应用') + ')';
+
+      item.appendChild(spanTime);
+      item.appendChild(document.createTextNode(' '));
+      item.appendChild(spanKey);
+      item.appendChild(document.createTextNode(' '));
+      item.appendChild(spanAction);
+      item.appendChild(document.createTextNode(' '));
+      item.appendChild(spanApp);
+
       logList.insertBefore(item, logList.firstChild);
       if (logList.children.length > 30) logList.removeChild(logList.lastChild);
     }
