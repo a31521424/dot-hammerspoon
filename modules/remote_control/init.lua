@@ -222,9 +222,30 @@ local function applyHidutil(vendorID, productID)
   return status == true
 end
 
-local function resetHidutil()
-  log.i("Clearing all hidutil user key mappings")
-  hs.execute("hidutil property --set '{\"UserKeyMapping\":[]}'")
+local function getMatchingVidPid(vendorID, productID)
+  local dev = (state.config and state.config.device) or {}
+  local vid = vendorID or dev.vendorID or 10007
+  local pid = productID or dev.productID or 12984
+  return vid, pid
+end
+
+local function buildHidutilResetCommand(vendorID, productID)
+  local vid, pid = getMatchingVidPid(vendorID, productID)
+  return string.format("hidutil property --matching '{\"VendorID\":%d,\"ProductID\":%d}' --set '{\"UserKeyMapping\":[]}'", vid, pid)
+end
+
+M._hidutilResetCommand = function(vid, pid)
+  return buildHidutilResetCommand(vid, pid)
+end
+
+local function resetHidutil(vendorID, productID)
+  local vid, pid = getMatchingVidPid(vendorID, productID)
+  if vid == 0 or pid == 0 then
+    return
+  end
+  local cmd = buildHidutilResetCommand(vid, pid)
+  log.i(string.format("Clearing hidutil user key mappings for VID=%d PID=%d", vid, pid))
+  hs.execute(cmd)
 end
 
 local function trim(s)
@@ -615,7 +636,9 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     if state.keyTimers[keyName] then
       state.keyTimers[keyName]:stop()
     end
-    state.keyTimers[keyName] = hs.timer.doAfter(holdMs / 1000, function()
+    local t
+    t = hs.timer.doAfter(holdMs / 1000, function()
+      if state.keyTimers[keyName] ~= t then return end
       state.keyTimers[keyName] = nil
       state.pendingDoubleTap[keyName] = nil
       if state.activeKeys[keyName] then
@@ -624,6 +647,7 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
         pushEventToDashboard(keyName, "hold", action, appTitle)
       end
     end)
+    state.keyTimers[keyName] = t
     return true
   else
     -- KeyUp
@@ -656,12 +680,15 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       local doubleTapAction = resolveKeyAction(keyName, "double_tap")
       if doubleTapAction then
         -- Delay execution to detect potential second tap
-        state.doubleTapTimers[keyName] = hs.timer.doAfter(doubleIntervalMs / 1000, function()
+        local t
+        t = hs.timer.doAfter(doubleIntervalMs / 1000, function()
+          if state.doubleTapTimers[keyName] ~= t then return end
           state.doubleTapTimers[keyName] = nil
           local action = resolveKeyAction(keyName, "tap")
           executeAction(action, keyName, "tap")
           pushEventToDashboard(keyName, "tap", action, appTitle)
         end)
+        state.doubleTapTimers[keyName] = t
       else
         -- No double-tap configured: fire tap immediately with zero delay
         local action = resolveKeyAction(keyName, "tap")
@@ -710,14 +737,40 @@ local function setupEventTap()
 end
 
 -- IOHID helper for keys that hidutil cannot remap (e.g. Back button 0xF1)
-local function startHidListener()
-  if state.hidTask and state.hidTask:isRunning() then
-    state.hidTask:terminate()
-    state.hidTask = nil
+-- Listener fallback. Do NOT use pkill -f.
+-- ps columns: pid, comm (basename), args (full argv)
+local function reapOrphanListeners()
+  local bin = resolveFile("listener", "remote_hid_listener")
+  local out = hs.execute("/bin/ps -Ao pid=,comm=,args=") or ""
+  for line in out:gmatch("[^\n]+") do
+    local pid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
+    if pid and comm and args then
+      local isListener = (comm == "listener" or comm == "remote_hid_listener")
+      local startsWithBin = (args:sub(1, #bin) == bin)
+      local isSwift = args:find(".swift", 1, true) ~= nil
+      if isListener and startsWithBin and not isSwift then
+        hs.execute("/bin/kill " .. pid)
+      end
+    end
   end
+end
 
-  -- Terminate any lingering instances from past sessions/reloads
-  hs.execute("pkill -f 'remote_hid_listener|modules/remote_control/listener'")
+local function killOwnListener()
+  local task = state.hidTask
+  state.hidTask = nil  -- MUST before terminate, so completion is a no-op
+  if task ~= nil then
+    local pid = task:pid()
+    pcall(function() task:terminate() end)
+    if pid ~= nil then
+      hs.execute("/bin/kill " .. tostring(pid))
+    end
+  end
+  reapOrphanListeners()  -- see pipeline below; never pkill -f listener.swift
+end
+
+-- IOHID helper for keys that hidutil cannot remap (e.g. Back button 0xF1)
+local function startHidListener()
+  killOwnListener()
 
   local helperBin = resolveFile("listener", "remote_hid_listener")
   local swiftSrc = resolveFile("listener.swift", "remote_hid_listener.swift")
@@ -736,8 +789,15 @@ local function startHidListener()
   local args = { "--vid", tostring(vid), "--pid", tostring(pid) }
 
   local stdoutBuffer = ""
-  state.hidTask = hs.task.new(helperBin, function(code, stdout, stderr)
-    logToFile("remote_hid_listener exited code=%d", code or -1)
+  local taskRef
+  taskRef = hs.task.new(helperBin, function(code, stdout, stderr)
+    if state.hidTask ~= taskRef then
+      return  -- supervised restart; do not resetHidutil
+    end
+    state.hidTask = nil
+    if not state.sessionLocked then
+      resetHidutil()
+    end
   end, function(task, stdout, stderr)
     if stdout and stdout ~= "" then
       stdoutBuffer = stdoutBuffer .. stdout
@@ -777,19 +837,17 @@ local function startHidListener()
     return true
   end, args)
 
+  state.hidTask = taskRef
   if state.hidTask:start() then
     log.i("remote_hid_listener started successfully for Back button (0xF1)")
   else
     log.ef("Failed to start remote_hid_listener task")
+    state.hidTask = nil
   end
 end
 
 local function stopHidListener()
-  if state.hidTask and state.hidTask:isRunning() then
-    state.hidTask:terminate()
-    state.hidTask = nil
-  end
-  hs.execute("pkill -f 'remote_hid_listener|modules/remote_control/listener'")
+  killOwnListener()
 end
 
 -- Control Panel Webview Management
@@ -821,7 +879,7 @@ local function setupDashboard()
       end
     elseif action == "reset_hidutil" then
       resetHidutil()
-      hs.alert.show("已重置清空 hidutil 映射", 1.5)
+      hs.alert.show("已还原本遥控器 hidutil 映射", 1.5)
     elseif action == "detect_devices" or action == "refresh_status" then
       M.refreshDashboardData()
     end
@@ -959,74 +1017,56 @@ function M.toggleDashboard()
   end
 end
 
-function M.start(options)
-  options = options or {}
-  state.config = loadConfig()
-
-  setupEventTap()
-
-  -- Auto apply hidutil if configured
-  if state.config.device and state.config.device.autoApplyHidutil then
-    local vid = state.config.device.vendorID
-    local pid = state.config.device.productID
-    if vid and pid and vid > 0 and pid > 0 then
-      applyHidutil(vid, pid)
-    end
+local function stopMouseTimer()
+  if state.mouseTimer ~= nil then
+    pcall(function() state.mouseTimer:stop() end)
+    state.mouseTimer = nil
   end
-
-  -- Start IOHID listener for Back button (0xF1) and non-standard HID keys
-  startHidListener()
-
-  -- Global shortcut to summon dashboard (Option + Shift + R)
-  state.hotkey = hs.hotkey.bind({ "alt", "shift" }, "r", function()
-    M.toggleDashboard()
-  end)
-
-  -- Cleanup on Hammerspoon reload / exit
-  local prevShutdown = hs.shutdownCallback
-  hs.shutdownCallback = function()
-    stopHidListener()
-    for _, t in pairs(state.keyTimers) do t:stop() end
-    state.keyTimers = {}
-    for _, t in pairs(state.doubleTapTimers) do t:stop() end
-    state.doubleTapTimers = {}
-    state.pendingDoubleTap = {}
-    state.activeKeys = {}
-    if state.config.device and state.config.device.autoApplyHidutil then
-      resetHidutil()
-    end
-    if type(prevShutdown) == "function" then
-      prevShutdown()
-    end
-  end
-
-  log.i("RemoteControl module started successfully")
-  return M
+  state.mouseHeldKey = nil
 end
+M.stopMouseTimer = stopMouseTimer
 
 function M.stop()
-  stopHidListener()
-  if state.eventtap then
-    state.eventtap:stop()
-    state.eventtap = nil
-  end
-  if state.hotkey then
-    state.hotkey:delete()
-    state.hotkey = nil
-  end
-  if state.dashboard then
-    state.dashboard:delete()
-    state.dashboard = nil
-  end
-  for _, t in pairs(state.keyTimers) do t:stop() end
+  killOwnListener()
+  if state.eventtap then state.eventtap:stop(); state.eventtap = nil end
+  if state.hotkey then state.hotkey:delete(); state.hotkey = nil end
+  if state.dashboard then pcall(function() state.dashboard:delete() end); state.dashboard = nil end
+  if state.lockWatcher then pcall(function() state.lockWatcher:stop() end); state.lockWatcher = nil end
+  stopMouseTimer()
+  for _, t in pairs(state.keyTimers) do pcall(function() t:stop() end) end
   state.keyTimers = {}
-  for _, t in pairs(state.doubleTapTimers) do t:stop() end
+  for _, t in pairs(state.doubleTapTimers) do pcall(function() t:stop() end) end
   state.doubleTapTimers = {}
   state.pendingDoubleTap = {}
   state.activeKeys = {}
   state.mouseMode = false
   resetHidutil()
-  log.i("RemoteControl module stopped")
+end
+
+function M.start(options)
+  M.stop()  -- first line; re-entrant. PR 1 MUST keep this.
+  options = options or {}
+  state.config = loadConfig()
+  -- PR 1: do NOT call rebuildBundleMaps / rebuildTransitKeyMap / attachLockWatcher
+  setupEventTap()
+  resetHidutil()
+  startHidListener()
+  if state.config.device and state.config.device.autoApplyHidutil then
+    local vid = state.config.device.vendorID
+    local pid = state.config.device.productID
+    if vid and pid and vid > 0 and pid > 0 then
+      applyHidutil(vid, pid)  -- old F-key table until PR 2; residual Home/F23
+    end
+  end
+  state.hotkey = hs.hotkey.bind({ "alt", "shift" }, "r", function()
+    M.toggleDashboard()
+  end)
+  local prevShutdown = hs.shutdownCallback
+  hs.shutdownCallback = function()
+    M.stop()
+    if type(prevShutdown) == "function" then prevShutdown() end
+  end
+  return M
 end
 
 M._state = state
@@ -1057,24 +1097,25 @@ end
 M.testTriggerKey = handleKeyEvent
 M.testFireTimer = function(keyName)
   local timer = state.keyTimers[keyName]
-  if timer then
-    state.keyTimers[keyName] = nil
-    state.pendingDoubleTap[keyName] = nil
-    if state.activeKeys[keyName] then
-      local action = resolveKeyAction(keyName, "hold")
-      executeAction(action, keyName, "hold")
-      pushEventToDashboard(keyName, "hold", action, "Test")
-    end
+  if not timer then return end
+  timer:stop()
+  state.keyTimers[keyName] = nil
+  state.pendingDoubleTap[keyName] = nil
+  if state.activeKeys[keyName] then
+    local action = resolveKeyAction(keyName, "hold")
+    executeAction(action, keyName, "hold")
+    pushEventToDashboard(keyName, "hold", action, "Test")
   end
 end
+
 M.testFireDoubleTapTimer = function(keyName)
   local timer = state.doubleTapTimers[keyName]
-  if timer then
-    state.doubleTapTimers[keyName] = nil
-    local action = resolveKeyAction(keyName, "tap")
-    executeAction(action, keyName, "tap")
-    pushEventToDashboard(keyName, "tap", action, "Test")
-  end
+  if not timer then return end
+  timer:stop()
+  state.doubleTapTimers[keyName] = nil
+  local action = resolveKeyAction(keyName, "tap")
+  executeAction(action, keyName, "tap")
+  pushEventToDashboard(keyName, "tap", action, "Test")
 end
 
 return M

@@ -218,6 +218,7 @@ assertEq(executed[1].action, "action:show_desktop", "Double-tap action should re
 print("  ✓ Double-tap sequence successfully detected and dispatched.")
 
 -- 5e: Double-Tap timeout fallback to Single Tap
+-- 不得在真实桌面触发 Mission Control；不得在清 mock 后 usleep
 executed = {}
 RC.testTriggerKey("home", true, false)
 RC.testTriggerKey("home", false, false)
@@ -238,7 +239,30 @@ assertTrue(eatenVolDown, "Mouse mode volume_down should be consumed")
 state.mouseMode = false
 print("  ✓ Mouse mode scroll wheel integration verified.")
 
--- Restore hook
+-- FIX-05: Test hidutil reset command string contains --matching VID/PID
+local resetCmd = RC._hidutilResetCommand and RC._hidutilResetCommand(10007, 12984)
+assertTrue(type(resetCmd) == "string", "reset command must be string")
+assertTrue(resetCmd:find("--matching", 1, true) ~= nil, "reset command must contain --matching")
+assertTrue(resetCmd:find('"VendorID":10007', 1, true) ~= nil, "reset command must match VendorID")
+assertTrue(resetCmd:find('"ProductID":12984', 1, true) ~= nil, "reset command must match ProductID")
+assertTrue(resetCmd:find('"UserKeyMapping":%[%]') ~= nil or resetCmd:find('"UserKeyMapping":[]', 1, true) ~= nil, "reset command must set empty UserKeyMapping")
+print("  ✓ FIX-05: hidutil reset command correctly scoped with --matching VID/PID.")
+
+-- Teardown (Algorithm G): stop all timers before clearing mock, so background timers never fire to real desktop
+for _, t in pairs(state.keyTimers or {}) do pcall(function() t:stop() end) end
+state.keyTimers = {}
+for _, t in pairs(state.doubleTapTimers or {}) do pcall(function() t:stop() end) end
+state.doubleTapTimers = {}
+if state.mouseTimer ~= nil then
+  pcall(function() state.mouseTimer:stop() end)
+  state.mouseTimer = nil
+end
+if RC.stopMouseTimer then
+  RC.stopMouseTimer()
+end
+state.mouseMode = false
+
+-- Restore hook only after timers are stopped
 RC._mockExecuteAction = nil
 
 print("\n=======================================================")

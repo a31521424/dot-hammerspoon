@@ -2,8 +2,7 @@
 -- another Dock icon.
 hs.dockicon.hide()
 
--- Enable AppleScript and local IPC for health checks and troubleshooting.
-hs.allowAppleScript(true)
+-- IPC 供 hs -c 测试与排障；不开启 AppleScript 自动化入口。
 require("hs.ipc")
 
 -- Configure package.path to discover modular packages under ~/.hammerspoon/modules/
@@ -105,7 +104,7 @@ VoiceInput = require("modules.voice_input").start({
 
 -- Remote Control Engine: maps Bluetooth/HID remote hardware keys to Web development
 -- actions (Termux/Terminal AI agent approvals, browser live reloads, mouse mode),
--- integrates directly with WindowSwitcher and VoiceInput (F18), and provides
+-- integrates directly with WindowSwitcher and VoiceInput, and provides
 -- a persistent Control Panel (Dashboard).
 RemoteControl = require("modules.remote_control").start()
 

@@ -14,7 +14,7 @@ local M = {}
 
 local log = hs.logger.new("voice-input", "debug")
 local API_KEY_ENV = "HAMMERSPOON_VOICE_DOUBAO_API_KEY"
-local DEBUG = true
+local DEBUG = false
 local moduleDir = (function()
   local src = debug.getinfo(1, "S").source
   if src:sub(1, 1) == "@" then
@@ -952,8 +952,8 @@ local function recognizeFlash(options, wavBytes, callback)
       return
     end
     local text = findText(decodeJson(body)) or ""
-    dbg("flash ok dur=%.3f bytes=%d http=%s text_len=%d preview=%s",
-      duration, #wavBytes, tostring(status), #text, previewText(text))
+    dbg("flash ok dur=%.3f bytes=%d http=%s text_len=%d",
+      duration, #wavBytes, tostring(status), #text)
     callback(nil, text)
   end)
 end
@@ -1032,7 +1032,140 @@ local function recognizeWav(options, wavBytes, callback)
   end)
 end
 
+local function reapOrphanDaemons(socketPath)
+  local script = resolveModuleFile("stream.py", "voice_stream.py")
+  local out = hs.execute("/bin/ps -Ao pid=,comm=,args=") or ""
+  for line in out:gmatch("[^\n]+") do
+    local pid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
+    if pid and args
+      and args:find("stream.py", 1, true)
+      and args:find("--daemon", 1, true)
+      and args:find(socketPath, 1, true)
+      and not args:find(".swift", 1, true) then
+      hs.execute("/bin/kill " .. pid)
+    end
+  end
+end
+
+-- ffmpeg: only processes whose args contain a hammerspoon-voice- segment dir
+local function reapOrphanFfmpeg()
+  local marker = "hammerspoon-voice-"
+  local out = hs.execute("/bin/ps -Ao pid=,comm=,args=") or ""
+  for line in out:gmatch("[^\n]+") do
+    local pid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
+    if pid and comm and args
+      and comm:find("ffmpeg", 1, true)
+      and args:find(marker, 1, true)
+      and args:find("-f avfoundation", 1, true) then
+      hs.execute("/bin/kill -9 " .. pid)
+    end
+  end
+end
+
+local function teardownInstance(state)
+  if state == nil then return end
+  state.generation = (state.generation or 0) + 1
+  state.active = false
+  state.stopping = false
+  state.finished = true
+  state.failed = true
+
+  -- Always bump token so a pending mutePlayback doAfter cannot fire.
+  state.outputToken = (state.outputToken or 0) + 1
+  local guard = state.outputGuard
+  state.outputGuard = nil
+  if guard ~= nil then
+    local output = nil
+    if guard.uid ~= nil then
+      output = hs.audiodevice.findDeviceByUID(guard.uid)
+    end
+    if output == nil then
+      output = hs.audiodevice.defaultOutputDevice()
+    end
+    if output ~= nil then
+      if guard.muted then
+        pcall(function() output:setMuted(true) end)
+      else
+        pcall(function() output:setMuted(false) end)
+      end
+      if guard.volume ~= nil then
+        pcall(function() output:setVolume(guard.volume) end)
+      end
+    end
+  end
+
+  if state.levelTimer ~= nil then
+    pcall(function() state.levelTimer:stop() end)
+    state.levelTimer = nil
+  end
+  if state.liveTimer ~= nil then
+    pcall(function() state.liveTimer:stop() end)
+    state.liveTimer = nil
+  end
+
+  if state.streamSocket ~= nil then
+    pcall(function() state.streamSocket:disconnect() end)
+    state.streamSocket = nil
+  end
+  if state.streamTask ~= nil then
+    pcall(function()
+      if state.streamTask:isRunning() then
+        state.streamTask:terminate()
+      end
+    end)
+    state.streamTask = nil
+  end
+  state.streamBuf = ""
+
+  if state.audioTask ~= nil then
+    local pid = state.audioTask:pid()
+    pcall(function() state.audioTask:terminate() end)
+    if pid ~= nil then hs.execute("/bin/kill -9 " .. tostring(pid)) end
+    state.audioTask = nil
+  end
+  reapOrphanFfmpeg()
+
+  if state.daemonTask ~= nil then
+    local pid = state.daemonTask:pid()
+    pcall(function() state.daemonTask:terminate() end)
+    if pid ~= nil then hs.execute("/bin/kill " .. tostring(pid)) end
+    state.daemonTask = nil
+  end
+  reapOrphanDaemons(state.daemonSocketPath or "/tmp/hammerspoon_voice_stream.sock")
+  pcall(os.remove, state.daemonSocketPath or "/tmp/hammerspoon_voice_stream.sock")
+
+  local dir = state.segmentDir
+  state.segmentDir = nil
+  state.pcmBuffer = ""
+  state.ingested = {}
+  if dir ~= nil then
+    pcall(function()
+      for name in hs.fs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+          os.remove(dir .. "/" .. name)
+        end
+      end
+      hs.fs.rmdir(dir)
+    end)
+  end
+
+  if state.eventtap then
+    pcall(function() state.eventtap:stop() end)
+    state.eventtap = nil
+  end
+  if state.ui and state.ui.hide then
+    pcall(function() state.ui:hide() end)
+  end
+end
+
+function M.stop()
+  local inst = M._instance
+  M._instance = nil
+  teardownInstance(inst)
+end
+
 function M.start(options)
+  M.stop()  -- first line; no-op if nothing running
   options = options or {}
   local lexiconPath = options.hotwordsPath or defaultLexiconPath()
   ensureLexiconFile(lexiconPath)
@@ -1104,6 +1237,9 @@ function M.start(options)
   end
 
   local function cleanupCapture()
+    if state.segmentDir ~= nil then
+      pcall(os.remove, state.segmentDir .. "/.apikey")
+    end
     removeDir(state.segmentDir)
     state.segmentDir = nil
     state.pcmBuffer = ""
@@ -1265,15 +1401,15 @@ function M.start(options)
     end
     local corrected = applyReplacements(text, state.replacements)
     if corrected ~= text then
-      dbg("replace preview_from=%s preview_to=%s", previewText(text), previewText(corrected))
+      dbg("replace text_len=%d", #corrected)
       text = corrected
     end
     text = collapseRunawayRepeat(text)
     if text == state.utteranceCommitted then
       return
     end
-    dbg("apply preview session_len=%d window_len=%d text_len=%d preview=%s",
-      #state.sessionText, #state.utteranceCommitted, #text, previewText(text))
+    dbg("apply preview session_len=%d window_len=%d text_len=%d",
+      #state.sessionText, #state.utteranceCommitted, #text)
     state.utteranceCommitted = text
     state.lastResult = sessionTranscript()
     refreshPreview()
@@ -1365,7 +1501,7 @@ function M.start(options)
       state.ui:hide()
     end
     killStream()
-    dbg("finish gen=%d text_len=%d preview=%s", gen, #text, previewText(text))
+    dbg("finish gen=%d text_len=%d", gen, #text)
     if not state.autoPaste or text == "" then
       return
     end
@@ -1373,7 +1509,7 @@ function M.start(options)
       if state.generation ~= gen then
         return
       end
-      dbg("insert caret text_len=%d preview=%s", #text, previewText(text))
+      dbg("insert caret text_len=%d", #text)
       insertAtCaret(text)
     end)
   end
@@ -1406,7 +1542,7 @@ function M.start(options)
         return
       end
       if text ~= nil and text ~= "" then
-        dbg("polish ok text_len=%d preview=%s", #text, previewText(text))
+        dbg("polish ok text_len=%d", #text)
         state.sessionText = ""
         applyTranscript(text)
       else
@@ -1573,7 +1709,7 @@ function M.start(options)
     end
     local ok, msg = pcall(hs.json.decode, line)
     if not ok or type(msg) ~= "table" then
-      dbg("stream bad_line %s", previewText(line))
+      dbg("stream bad_line len=%d", #line)
       return
     end
     local event = msg.event
@@ -1622,6 +1758,7 @@ function M.start(options)
     if state.daemonTask ~= nil and state.daemonTask:isRunning() then
       return
     end
+    reapOrphanDaemons(state.daemonSocketPath or "/tmp/hammerspoon_voice_stream.sock")
     local args = {
       state.streamScript,
       "--daemon",
@@ -1661,6 +1798,7 @@ function M.start(options)
       if keyHandle ~= nil then
         keyHandle:write(state.apiKey)
         keyHandle:close()
+        hs.execute(string.format("/bin/chmod 600 %q", keyFile))
       end
       local hotFile = state.segmentDir .. "/.hotwords.json"
       local hotHandle = io.open(hotFile, "w")
@@ -2070,9 +2208,17 @@ function M.start(options)
   dbg("lexicon ready path=%s hotwords=%d replacements=%d",
     tostring(state.lexiconPath), #state.hotwords, countPairs(state.replacements))
   ensureDaemon()
+  M._instance = state
+  local prev = hs.shutdownCallback
+  hs.shutdownCallback = function()
+    M.stop()
+    if type(prev) == "function" then prev() end
+  end
   return state
 end
 
-resetDebugLog()
-dbg("module loaded debug=%s log=%s", tostring(DEBUG), DEBUG_LOG)
+if DEBUG then
+  resetDebugLog()
+  dbg("module loaded debug=%s log=%s", tostring(DEBUG), DEBUG_LOG)
+end
 return M
