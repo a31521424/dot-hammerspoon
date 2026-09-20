@@ -93,6 +93,8 @@ local state = {
   mouseTimer = nil,
   activeKeys = {},
   keyTimers = {},
+  doubleTapTimers = {},
+  pendingDoubleTap = {},
   recentLogs = {},
   lastFocusedTerminal = nil,
   lastFocusedBrowser = nil,
@@ -355,6 +357,24 @@ local function executeAction(actionStr, keyName, eventType)
     return
   end
 
+  if actionStr == "action:show_desktop" then
+    hs.eventtap.keyStroke({ "cmd" }, "f3", 10000)
+    return
+  end
+
+  if actionStr == "action:focus_input" then
+    local app = hs.application.frontmostApplication()
+    if app then
+      local bid = app:bundleID() or ""
+      if BROWSER_BUNDLES[bid] then
+        hs.eventtap.keyStroke({ "cmd" }, "l", 10000)
+      else
+        app:activate()
+      end
+    end
+    return
+  end
+
   if actionStr == "action:display_sleep" then
     logToFile("Executing display sleep (pmset displaysleepnow)")
     hs.execute("pmset displaysleepnow")
@@ -421,6 +441,30 @@ local function executeAction(actionStr, keyName, eventType)
     return
   end
 
+  if actionStr == "action:mute" or actionStr == "key:mute" then
+    logToFile("Toggling system mute")
+    hs.eventtap.event.newSystemKeyEvent("MUTE", true):post()
+    hs.eventtap.event.newSystemKeyEvent("MUTE", false):post()
+    return
+  end
+
+  if actionStr == "action:media_play_pause" or actionStr == "key:play_pause" then
+    logToFile("Toggling media play/pause")
+    hs.eventtap.event.newSystemKeyEvent("PLAY", true):post()
+    hs.eventtap.event.newSystemKeyEvent("PLAY", false):post()
+    return
+  end
+
+  if actionStr == "action:scroll_up" then
+    hs.eventtap.scrollWheel({ 0, 5 }, {}, "line")
+    return
+  end
+
+  if actionStr == "action:scroll_down" then
+    hs.eventtap.scrollWheel({ 0, -5 }, {}, "line")
+    return
+  end
+
   -- 8. Direct Key Stroke (e.g. key:ctrl+c, key:shift+cmd+r, key:return, key:delete)
   if actionStr:match("^key:") then
     local spec = actionStr:sub(5)
@@ -454,6 +498,9 @@ local function resolveKeyAction(keyName, triggerType, profileOverride)
     keyDefs = profiles["global"].keys and profiles["global"].keys[keyName]
   end
   if keyDefs then
+    if triggerType == "double_tap" then
+      return keyDefs["double_tap"]
+    end
     return keyDefs[triggerType] or keyDefs["tap"]
   end
   return nil
@@ -474,7 +521,7 @@ local function pushEventToDashboard(keyName, eventType, action, frontApp)
   end
 end
 
--- Mouse Mode handler
+-- Mouse Mode handler (Direction ring moves pointer, OK is left click, Back is right click, Vol+/Vol- is scroll wheel)
 local function handleMouseMovement(keyName)
   local pos = hs.mouse.absolutePosition()
   local speed = (state.config.settings and state.config.settings.mouseSpeed) or 15
@@ -488,6 +535,12 @@ local function handleMouseMovement(keyName)
     return true
   elseif keyName == "back" then
     hs.eventtap.rightClick(pos)
+    return true
+  elseif keyName == "volume_up" then
+    hs.eventtap.scrollWheel({ 0, 4 }, {}, "line")
+    return true
+  elseif keyName == "volume_down" then
+    hs.eventtap.scrollWheel({ 0, -4 }, {}, "line")
     return true
   end
 
@@ -521,12 +574,14 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   if state.mouseMode and keyName ~= "power" and keyName ~= "voice" then
     if isDown then
       handleMouseMovement(keyName)
-      pushEventToDashboard(keyName, "mouse", "move_pointer", appTitle)
+      local actionDesc = (keyName:find("volume") and "scroll") or "move_pointer"
+      pushEventToDashboard(keyName, "mouse", actionDesc, appTitle)
     end
     return true
   end
 
   local holdMs = (state.config.settings and state.config.settings.holdThresholdMs) or 350
+  local doubleIntervalMs = (state.config.settings and state.config.settings.doubleClickIntervalMs) or 250
 
   if isDown then
     -- If key is already marked active, this is a hardware repeat packet while held.
@@ -549,12 +604,20 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       return true
     end
 
+    -- Check if there is a pending double-tap timer for this key
+    if state.doubleTapTimers[keyName] then
+      state.doubleTapTimers[keyName]:stop()
+      state.doubleTapTimers[keyName] = nil
+      state.pendingDoubleTap[keyName] = true
+    end
+
     -- Setup hold timer
     if state.keyTimers[keyName] then
       state.keyTimers[keyName]:stop()
     end
     state.keyTimers[keyName] = hs.timer.doAfter(holdMs / 1000, function()
       state.keyTimers[keyName] = nil
+      state.pendingDoubleTap[keyName] = nil
       if state.activeKeys[keyName] then
         local action = resolveKeyAction(keyName, "hold")
         executeAction(action, keyName, "hold")
@@ -573,14 +636,41 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       return true
     end
 
-    -- If hold timer was still pending, this was a short press (Tap)
+    -- If hold timer was still pending, this was a short press (Tap or Double Tap)
     if state.keyTimers[keyName] ~= nil then
       state.keyTimers[keyName]:stop()
       state.keyTimers[keyName] = nil
 
-      local action = resolveKeyAction(keyName, "tap")
-      executeAction(action, keyName, "tap")
-      pushEventToDashboard(keyName, "tap", action, appTitle)
+      -- Was this the second tap of a double-tap?
+      if state.pendingDoubleTap[keyName] then
+        state.pendingDoubleTap[keyName] = nil
+        local doubleAction = resolveKeyAction(keyName, "double_tap")
+        if doubleAction then
+          executeAction(doubleAction, keyName, "double_tap")
+          pushEventToDashboard(keyName, "double_tap", doubleAction, appTitle)
+          return true
+        end
+      end
+
+      -- Check if current profile has double_tap configured for this key
+      local doubleTapAction = resolveKeyAction(keyName, "double_tap")
+      if doubleTapAction then
+        -- Delay execution to detect potential second tap
+        state.doubleTapTimers[keyName] = hs.timer.doAfter(doubleIntervalMs / 1000, function()
+          state.doubleTapTimers[keyName] = nil
+          local action = resolveKeyAction(keyName, "tap")
+          executeAction(action, keyName, "tap")
+          pushEventToDashboard(keyName, "tap", action, appTitle)
+        end)
+      else
+        -- No double-tap configured: fire tap immediately with zero delay
+        local action = resolveKeyAction(keyName, "tap")
+        executeAction(action, keyName, "tap")
+        pushEventToDashboard(keyName, "tap", action, appTitle)
+      end
+    else
+      -- Hold was already triggered, ensure pending double-tap is cleared
+      state.pendingDoubleTap[keyName] = nil
     end
     return true
   end
@@ -672,6 +762,9 @@ local function startHidListener()
               logToFile("Remote control disconnected")
               for _, t in pairs(state.keyTimers) do t:stop() end
               state.keyTimers = {}
+              for _, t in pairs(state.doubleTapTimers) do t:stop() end
+              state.doubleTapTimers = {}
+              state.pendingDoubleTap = {}
               state.activeKeys = {}
               M.refreshDashboardData()
             elseif event.error then
@@ -895,6 +988,9 @@ function M.start(options)
     stopHidListener()
     for _, t in pairs(state.keyTimers) do t:stop() end
     state.keyTimers = {}
+    for _, t in pairs(state.doubleTapTimers) do t:stop() end
+    state.doubleTapTimers = {}
+    state.pendingDoubleTap = {}
     state.activeKeys = {}
     if state.config.device and state.config.device.autoApplyHidutil then
       resetHidutil()
@@ -924,6 +1020,9 @@ function M.stop()
   end
   for _, t in pairs(state.keyTimers) do t:stop() end
   state.keyTimers = {}
+  for _, t in pairs(state.doubleTapTimers) do t:stop() end
+  state.doubleTapTimers = {}
+  state.pendingDoubleTap = {}
   state.activeKeys = {}
   state.mouseMode = false
   resetHidutil()
@@ -960,11 +1059,21 @@ M.testFireTimer = function(keyName)
   local timer = state.keyTimers[keyName]
   if timer then
     state.keyTimers[keyName] = nil
+    state.pendingDoubleTap[keyName] = nil
     if state.activeKeys[keyName] then
       local action = resolveKeyAction(keyName, "hold")
       executeAction(action, keyName, "hold")
       pushEventToDashboard(keyName, "hold", action, "Test")
     end
+  end
+end
+M.testFireDoubleTapTimer = function(keyName)
+  local timer = state.doubleTapTimers[keyName]
+  if timer then
+    state.doubleTapTimers[keyName] = nil
+    local action = resolveKeyAction(keyName, "tap")
+    executeAction(action, keyName, "tap")
+    pushEventToDashboard(keyName, "tap", action, "Test")
   end
 end
 

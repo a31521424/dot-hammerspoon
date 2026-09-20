@@ -26,7 +26,7 @@
         "right": { "tap": "key:right", "hold": "key:right" },
         "volume_up": { "tap": "key:volume_up" },
         "volume_down": { "tap": "key:volume_down" },
-        "home": { "tap": "action:mission_control" },
+        "home": { "tap": "action:mission_control", "double_tap": "action:show_desktop" },
         "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
       }
     },
@@ -53,7 +53,7 @@
         "right": { "tap": "key:alt+right" },
         "volume_up": { "tap": "macro:tmux_next_window" },
         "volume_down": { "tap": "macro:tmux_prev_window" },
-        "home": { "tap": "action:mission_control" },
+        "home": { "tap": "action:mission_control", "double_tap": "action:show_desktop" },
         "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
       }
     },
@@ -79,7 +79,7 @@
         "right": { "tap": "key:alt+cmd+right" },
         "volume_up": { "tap": "key:ctrl+tab" },
         "volume_down": { "tap": "key:ctrl+shift+tab" },
-        "home": { "tap": "action:mission_control" },
+        "home": { "tap": "action:mission_control", "double_tap": "action:show_desktop" },
         "power": { "tap": "action:display_sleep", "hold": "action:toggle_mouse_mode" }
       }
     }

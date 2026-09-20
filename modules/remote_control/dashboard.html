@@ -373,6 +373,7 @@
           <tr>
             <th style="width: 110px;">物理键</th>
             <th>短按 (Tap)</th>
+            <th>双击 (Double Tap)</th>
             <th>长按 (Hold, >350ms)</th>
           </tr>
         </thead>
@@ -419,8 +420,14 @@
       { val: "action:switch_to_terminal", label: "💻 一键切换并聚焦终端" },
       { val: "action:toggle_mouse_mode", label: "🖱️ 切换鼠标模式 (方向环移指针)" },
       { val: "action:mission_control", label: "⌂ 调度中心 (Mission Control)" },
+      { val: "action:show_desktop", label: "🖥️ 显示桌面 (Show Desktop)" },
+      { val: "action:focus_input", label: "🎯 聚焦当前输入框 (Focus Input)" },
       { val: "action:display_sleep", label: "⏻ 显示器休眠" },
       { val: "action:escape_layer", label: "🚨 逃生键 (退出所有模式/关闭浮层)" },
+      { val: "action:mute", label: "🔇 系统静音切换" },
+      { val: "action:media_play_pause", label: "⏯️ 媒体播放/暂停" },
+      { val: "action:scroll_up", label: "📜 向上滚轮滚动" },
+      { val: "action:scroll_down", label: "📜 向下滚轮滚动" },
       { val: "macro:approve_agent", label: "⚡ AI Agent 批准 (发送 y + Enter)" },
       { val: "macro:restart_dev_server", label: "⚡ 重启服务 (Ctrl+C -> 上箭头 -> Enter)" },
       { val: "macro:tmux_next_window", label: "⚡ tmux 下一个窗口 (Ctrl+B -> n)" },
@@ -499,11 +506,13 @@
       for (let k in keyLabels) {
         const row = document.createElement('tr');
         const currentTap = keys[k] ? (keys[k].tap || '') : '';
+        const currentDoubleTap = keys[k] ? (keys[k].double_tap || '') : '';
         const currentHold = keys[k] ? (keys[k].hold || '') : '';
 
         row.innerHTML = `
           <td><strong>${keyLabels[k]}</strong></td>
           <td>${buildSelect(k, 'tap', currentTap)}</td>
+          <td>${buildSelect(k, 'double_tap', currentDoubleTap)}</td>
           <td>${buildSelect(k, 'hold', currentHold)}</td>
         `;
         tbody.appendChild(row);

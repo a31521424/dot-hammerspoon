@@ -200,6 +200,44 @@ assertEq(executed[2].type, "up", "Voice up event type mismatch")
 assertEq(executed[2].action, "action:voice_input", "Voice action mismatch")
 print("  ✓ Voice hold-to-talk stream started on down and stopped on up.")
 
+-- 5d: Double-Tap detection test (when double_tap is configured)
+executed = {}
+-- First tap
+RC.testTriggerKey("home", true, false)
+RC.testTriggerKey("home", false, false)
+assertTrue(state.doubleTapTimers["home"] ~= nil, "Double-tap timer should be waiting for second tap")
+assertEq(#executed, 0, "No tap action should execute immediately when double_tap is configured")
+
+-- Second tap arrives within window
+RC.testTriggerKey("home", true, false)
+assertTrue(state.pendingDoubleTap["home"] == true, "Second Down should mark pendingDoubleTap")
+RC.testTriggerKey("home", false, false)
+assertEq(#executed, 1, "Double-tap action should execute on second KeyUp")
+assertEq(executed[1].type, "double_tap", "Action type should be double_tap")
+assertEq(executed[1].action, "action:show_desktop", "Double-tap action should resolve to show_desktop")
+print("  ✓ Double-tap sequence successfully detected and dispatched.")
+
+-- 5e: Double-Tap timeout fallback to Single Tap
+executed = {}
+RC.testTriggerKey("home", true, false)
+RC.testTriggerKey("home", false, false)
+assertTrue(state.doubleTapTimers["home"] ~= nil, "Double-tap timer should be waiting")
+RC.testFireDoubleTapTimer("home") -- Timer expires
+assertEq(#executed, 1, "Single tap should execute when double-tap timer expires")
+assertEq(executed[1].type, "tap", "Action type should be tap")
+assertEq(executed[1].action, "action:mission_control", "Action should resolve to mission_control")
+print("  ✓ Double-tap timeout correctly falls back to single tap.")
+
+-- Test 6: Mouse Mode & Scroll Wheel
+print("[Test 6] Mouse Mode: Pointer & Scroll Wheel check...")
+state.mouseMode = true
+local eatenVolUp = RC.testTriggerKey("volume_up", true, false)
+assertTrue(eatenVolUp, "Mouse mode volume_up should be consumed")
+local eatenVolDown = RC.testTriggerKey("volume_down", true, false)
+assertTrue(eatenVolDown, "Mouse mode volume_down should be consumed")
+state.mouseMode = false
+print("  ✓ Mouse mode scroll wheel integration verified.")
+
 -- Restore hook
 RC._mockExecuteAction = nil
 
