@@ -1,7 +1,9 @@
--- Copy this file to voice_hotwords.lua and edit your own list.
--- voice_hotwords.lua is ignored by Git and is not part of the project.
+-- Copy this file to hotwords.lua next to this example and edit your list.
+-- hotwords.lua is ignored by Git and is not part of the project.
 --
--- Path: ~/.hammerspoon/voice_hotwords.lua
+-- Path: ~/.hammerspoon/modules/voice_input/hotwords.lua
+-- Fallback (only if the file above is missing):
+--   ~/.hammerspoon/voice_hotwords.lua
 -- After editing, reload Hammerspoon (Reload Config).
 --
 -- hotwords: sent to streaming ASR and the final Flash pass.

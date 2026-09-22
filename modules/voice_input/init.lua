@@ -7,9 +7,10 @@
 -- preview closes and the complete text is pasted at the caret.
 -- System output is muted while listening so speaker audio is not
 -- captured again by the microphone.
--- Customize recall words in ~/.hammerspoon/voice_hotwords.lua
--- (copy from voice_hotwords.lua.example). That file is local and
--- is not part of the project defaults.
+-- Customize recall words in modules/voice_input/hotwords.lua
+-- (copy from hotwords.lua.example). That file is local and is
+-- not part of the project defaults. ~/.hammerspoon/voice_hotwords.lua
+-- is only a fallback if the module file is missing.
 local M = {}
 
 local log = hs.logger.new("voice-input", "debug")
