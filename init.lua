@@ -22,6 +22,12 @@ WindowSwitcher = require("modules.window_switcher").start({
   -- Set false to include windows from all displays again.
   currentScreenOnly = true,
 
+  -- Allow substantive untitled windows (such as mobile mirroring/remote control windows).
+  -- com.vivo.pcsuite.vivoScreen is included by default.
+  allowUntitledApps = {
+    ["com.vivo.pcsuite.vivoScreen"] = true,
+  },
+
   -- Built-in switcher UI: title-only, without window previews. Its native
   -- state machine keeps repeated Option-Tab presses fast and reliable.
   ui = {

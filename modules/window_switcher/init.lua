@@ -7,6 +7,11 @@ local DEFAULT_ALLOWED_SUBROLES = {
   AXDialog = true,
 }
 
+local DEFAULT_ALLOW_UNTITLED_APPS = {
+  ["com.vivo.pcsuite.vivoScreen"] = true,
+  ["手机投屏"] = true,
+}
+
 local DEFAULT_UI = {
   showTitles = true,
   showThumbnails = false,
@@ -119,8 +124,30 @@ local function safeScreenFrame(screen)
   return ok and frame or nil
 end
 
+local function resolveWindowTitle(window)
+  if window == nil then
+    return "Window"
+  end
+  local ok, title = pcall(function() return window:title() end)
+  if ok and title ~= nil and not string.match(title, "^%s*$") then
+    return title
+  end
+  local appOk, app = pcall(function() return window:application() end)
+  if appOk and app ~= nil then
+    local nameOk, name = pcall(function() return app:name() end)
+    if nameOk and name ~= nil and not string.match(name, "^%s*$") then
+      return name
+    end
+  end
+  return "Window"
+end
+
 local function makeWindowPredicate(config, ignored)
   local allowedSubroles = copyMap(config.allowedSubroles or DEFAULT_ALLOWED_SUBROLES)
+  local allowUntitledApps = copyMap(DEFAULT_ALLOW_UNTITLED_APPS)
+  for key, value in pairs(config.allowUntitledApps or {}) do
+    allowUntitledApps[key] = value
+  end
 
   return function(window)
     local ok, allowed = pcall(function()
@@ -170,17 +197,37 @@ local function makeWindowPredicate(config, ignored)
         return false
       end
 
-      local title = window:title()
-      if title == nil or string.match(title, "^%s*$") then
-        return false
-      end
-      if titleIsIgnored(title, appName, bundleID, ignored.titlePatterns) then
-        return false
-      end
-
       local frame = window:frame()
       if frame == nil or frame.w == nil or frame.h == nil
         or frame.w <= 1 or frame.h <= 1 then
+        return false
+      end
+
+      local rawTitle = window:title()
+      local hasTitle = rawTitle ~= nil and not string.match(rawTitle, "^%s*$")
+
+      if not hasTitle then
+        -- Untitled window handling:
+        -- Ensure this is a genuine substantive window rather than an auxiliary
+        -- toolbar, floating strip, or overlay (e.g. 398x37 toolbar in vivo remote control).
+        local isReasonableSize = frame.w >= 120 and frame.h >= 120
+        if not isReasonableSize then
+          return false
+        end
+
+        local isExplicitlyAllowedApp = (bundleID ~= nil and allowUntitledApps[bundleID])
+          or (appName ~= nil and allowUntitledApps[appName])
+        local zoom = window.zoomButtonRect and window:zoomButtonRect()
+        local hasStandardControls = (window.isMaximizable and window:isMaximizable() == true)
+          or (zoom ~= nil and zoom.w ~= nil and zoom.w > 0 and zoom.h ~= nil and zoom.h > 0)
+
+        if not (isExplicitlyAllowedApp or hasStandardControls) then
+          return false
+        end
+      end
+
+      local effectiveTitle = hasTitle and rawTitle or appName or "Window"
+      if titleIsIgnored(effectiveTitle, appName, bundleID, ignored.titlePatterns) then
         return false
       end
 
@@ -288,6 +335,9 @@ local function layoutSwitcherAsList(switcher, screen)
     item.titleFrame = titleFrame
     item.titleRect:setFrame(titleFrame)
     item.titleText:setFrame(titleFrame)
+    if item.titleText and item.titleText.setText then
+      item.titleText:setText(resolveWindowTitle(windows[index]))
+    end
     item.highlightFrame = rowFrame
     item.selRectFrame = rowFrame
   end
@@ -417,6 +467,7 @@ function M.start(options)
     includeHidden = options.includeHidden == true,
     currentScreenOnly = options.currentScreenOnly ~= false,
     allowedSubroles = options.allowedSubroles,
+    allowUntitledApps = options.allowUntitledApps,
   }
   local ignored = normalizeIgnored(options.ignored)
 

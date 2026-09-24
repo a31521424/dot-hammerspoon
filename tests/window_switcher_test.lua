@@ -42,6 +42,7 @@ local function drawing()
   return setmetatable({}, { __index = function(_, method)
     return function(self, value)
       if method == "setFrame" then self.frame = value end
+      if method == "setText" then self.text = value end
       return self
     end
   end })
@@ -180,4 +181,65 @@ assert(remoteCtrl.isVisible() == false)
 
 remoteCtrl:stop()
 
-return "PASS: pointer-based screen ownership, session isolation, layout, movement, minimized windows, fallbacks, reverse/click selection and all-screen opt-out"
+-- Untitled window tests (FIX: vivo remote screen support)
+local vivoApp = {
+  name = function() return "手机投屏" end,
+  bundleID = function() return "com.vivo.pcsuite.vivoScreen" end,
+  kind = function() return 1 end,
+  isHidden = function() return false end,
+}
+local vivoWin = {
+  owner = a,
+  id = function() return 99 end,
+  application = function() return vivoApp end,
+  isMinimized = function() return false end,
+  isVisible = function() return true end,
+  subrole = function() return "AXDialog" end,
+  title = function() return "" end,
+  frame = function() return { w = 613, h = 1404 } end,
+  isMaximizable = function() return true end,
+  zoomButtonRect = function() return { w = 16, h = 16 } end,
+  screen = function(self) return self.owner end,
+  unminimize = function() end,
+  raise = function() end,
+  focus = function(self) self.focused = true end,
+}
+local vivoToolbar = {
+  owner = a,
+  id = function() return 98 end,
+  application = function() return vivoApp end,
+  isMinimized = function() return false end,
+  isVisible = function() return true end,
+  subrole = function() return "AXDialog" end,
+  title = function() return "" end,
+  frame = function() return { w = 398, h = 37 } end,
+  isMaximizable = function() return false end,
+  zoomButtonRect = function() return { w = 0, h = 0 } end,
+  screen = function(self) return self.owner end,
+  unminimize = function() end,
+  raise = function() end,
+  focus = function(self) self.focused = true end,
+}
+
+local origVisible, origAll = visible, all
+visible = { vivoWin, vivoToolbar, a1 }
+all = { vivoWin, vivoToolbar, a1 }
+alt = true
+focused, pointer = a1, a
+
+local untitledCtrl = module.start()
+local untitledWindows = untitledCtrl.windowFilter:getWindows()
+expectIDs(untitledWindows, "99,1")
+
+untitledCtrl.next()
+assert(untitledCtrl.switcher.windows ~= nil)
+expectIDs(untitledCtrl.switcher.windows, "99,1")
+-- Verify title resolution set text on item 1 (vivoWin) to application name
+local item1Text = untitledCtrl.switcher.drawings[1].titleText.text
+assert(item1Text == "手机投屏", "titleText should fall back to app name '手机投屏', got: " .. tostring(item1Text))
+
+untitledCtrl:stop()
+visible, all = origVisible, origAll
+
+return "PASS: pointer-based screen ownership, session isolation, layout, movement, minimized windows, fallbacks, reverse/click selection, untitled/vivo window support and all-screen opt-out"
+
