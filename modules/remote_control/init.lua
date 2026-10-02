@@ -9,6 +9,7 @@
 --   - Persistent Control Panel (Dashboard) via hs.webview
 
 local M = {}
+local InputTarget = require("modules.input_target")
 
 local log = hs.logger.new("remote-ctrl", "debug")
 local configDir = hs.configdir or ((os.getenv("HOME") or "") .. "/.hammerspoon")
@@ -71,6 +72,21 @@ local HIDUTIL_MAPPINGS = {
   { src = 0xC00000030, dst = 0x700000073, keycode = 147, key = "power" },
   { src = 0xC00000224, dst = 0x70000006E, keycode = 80,  key = "back", isolationOnly = true },
 }
+-- IOHID supplies button identity. The OS only needs one inert transit key;
+-- F14/F15 can be translated into display-brightness events before keyDown taps.
+local ISOLATION_KEYCODE = 90 -- F20
+for _, row in ipairs(HIDUTIL_MAPPINGS) do
+  row.dst = 0x70000006F
+  row.keycode = ISOLATION_KEYCODE
+  row.isolationOnly = true
+end
+-- Some remotes emit consumer brightness events alongside keyboard events.
+for _, usage in ipairs({ 0x6F, 0x70 }) do
+  HIDUTIL_MAPPINGS[#HIDUTIL_MAPPINGS + 1] = {
+    src = 0xC00000000 + usage, dst = 0x70000006F,
+    keycode = ISOLATION_KEYCODE, key = "brightness", isolationOnly = true,
+  }
+end
 M.HIDUTIL_MAPPINGS = HIDUTIL_MAPPINGS
 
 local TRANSIT_KEY_MAP = {}
@@ -87,12 +103,7 @@ local function hidutilUserKeyMapping()
 end
 
 local function rebuildTransitKeyMap()
-  local map = {}
-  for _, row in ipairs(HIDUTIL_MAPPINGS) do
-    if not row.isolationOnly then
-      map[row.keycode] = row.key
-    end
-  end
+  local map = { [ISOLATION_KEYCODE] = "isolated_remote" }
   TRANSIT_KEY_MAP = map
   M.TRANSIT_KEY_MAP = map
 end
@@ -126,6 +137,7 @@ local state = {
   config = nil,
   eventtap = nil,
   hidTask = nil,
+  connectedDeviceCount = 0,
   dashboard = nil,
   dashboardUserContent = nil,
   isDashboardVisible = false,
@@ -139,6 +151,11 @@ local state = {
   keyTimers = {},
   doubleTapTimers = {},
   pendingDoubleTap = {},
+  pressContexts = {},
+  repeatTimers = {},
+  navigationEpoch = 0,
+  inputEpoch = 0,
+  reviewMode = false,
   recentLogs = {},
   lastFocusedTerminal = nil,
   lastFocusedBrowser = nil,
@@ -381,6 +398,7 @@ local stopMouseTimer
 -- Action Dispatcher
 local function executeAction(actionStr, keyName, eventType)
   if not actionStr or actionStr == "" then return end
+  if actionStr == "action:none" then return end
   logToFile("executeAction: [%s] -> %s (%s)", keyName, actionStr, eventType)
   if M._mockExecuteAction then
     M._mockExecuteAction(actionStr, keyName, eventType)
@@ -403,6 +421,35 @@ local function executeAction(actionStr, keyName, eventType)
 
   -- For other actions, fire on tap or hold (not on raw key up)
   if eventType == "up" then return end
+
+  if actionStr == "key:return" and VoiceInput then
+    if VoiceInput.active or VoiceInput.stopping or VoiceInput.pastePending then
+      hs.alert.show("语音尚未完成，请稍后按 OK 发送", 1)
+      return
+    end
+    if VoiceInput.pendingText and VoiceInput.resumePending then
+      VoiceInput.resumePending()
+      return
+    end
+  end
+
+  if actionStr == "key:ctrl+tab" or actionStr == "key:ctrl+shift+tab"
+      or actionStr == "action:focus_iterm" then
+    state.navigationEpoch = state.navigationEpoch + 1
+    state.reviewMode = false
+  end
+
+  if actionStr == "action:focus_iterm" then
+    state.reviewMode = false
+    hs.application.launchOrFocusByBundleID("com.googlecode.iterm2")
+    return
+  end
+
+  if actionStr == "action:toggle_review" then
+    state.reviewMode = not state.reviewMode
+    hs.alert.show(state.reviewMode and "查看输出：上下翻页，TV 退出，返回删除" or "已回到终端输入", 1.5)
+    return
+  end
 
   -- 2. Window Switcher (Alt-Tab)
   if actionStr == "action:window_switcher" then
@@ -506,6 +553,7 @@ local function executeAction(actionStr, keyName, eventType)
   if actionStr == "action:escape_layer" then
     stopMouseTimer()
     state.mouseMode = false
+    state.reviewMode = false
     if WindowSwitcher and WindowSwitcher.cancel then
       WindowSwitcher.cancel()
     end
@@ -665,6 +713,42 @@ stopMouseTimer = function()
 end
 M.stopMouseTimer = stopMouseTimer
 
+-- A missing key-up must not leave input running after disconnect, lock or restart.
+local function clearInputState(stopAllVoice)
+  state.inputEpoch = state.inputEpoch + 1
+  local remoteVoiceActive = false
+  for _, value in pairs(state.activeKeys) do
+    if value == "voice" then remoteVoiceActive = true end
+  end
+  stopMouseTimer()
+  for _, name in ipairs({ "keyTimers", "doubleTapTimers", "repeatTimers" }) do
+    for _, timer in pairs(state[name]) do timer:stop() end
+    state[name] = {}
+  end
+  state.pendingDoubleTap = {}
+  state.activeKeys = {}
+  state.pressContexts = {}
+  state.mouseMode = false
+  state.reviewMode = false
+  if (stopAllVoice or remoteVoiceActive) and VoiceInput and VoiceInput.active and VoiceInput.stop then
+    VoiceInput.stop()
+  end
+end
+
+local function setDeviceConnected(connected)
+  -- One remote can expose several HID services, each with its own callback.
+  if connected then
+    state.connectedDeviceCount = state.connectedDeviceCount + 1
+    if state.connectedDeviceCount == 1 and state.eventtap then state.eventtap:start() end
+  else
+    state.connectedDeviceCount = math.max(0, state.connectedDeviceCount - 1)
+    if state.connectedDeviceCount == 0 then
+      clearInputState()
+      if state.eventtap then state.eventtap:stop() end
+    end
+  end
+end
+
 local function doMouseStep(keyName, factor)
   factor = factor or 1
   if M._mockExecuteAction then
@@ -709,6 +793,7 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   if not keyName then
     return false  -- real keyboard / login window MUST pass through
   end
+  if keyName == "isolated_remote" then return true end
   if state.sessionLocked then
     stopMouseTimer()
     state.activeKeys[keyName] = nil
@@ -720,6 +805,11 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       state.doubleTapTimers[keyName]:stop()
       state.doubleTapTimers[keyName] = nil
     end
+    if state.repeatTimers[keyName] then
+      state.repeatTimers[keyName]:stop()
+      state.repeatTimers[keyName] = nil
+    end
+    state.pressContexts[keyName] = nil
     return true  -- swallow only known remote transit / IOHID names
   end
 
@@ -727,6 +817,30 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   local profileName, appTitle = currentProfile()
   logToFile("handleKeyEvent: keyName=%s keyCode=%s isDown=%s isRepeat=%s profile=%s app=%s",
     keyName, tostring(keyCode), tostring(isDown), tostring(isRepeat), profileName, appTitle or "System")
+
+  local settings = state.config.settings or {}
+  local targetBundleID = settings.targetBundleID
+  local app = hs.application.frontmostApplication()
+  local bid = state._testBundleID or (app and app:bundleID())
+  -- Always finish a voice press even if focus changed while recording.
+  if not isDown and state.activeKeys[keyName] == "voice" then
+    state.activeKeys[keyName] = nil
+    executeAction("action:voice_input", keyName, "up")
+    return true
+  end
+  if targetBundleID and bid ~= targetBundleID and keyName ~= "home" and keyName ~= "power" then
+    if state.keyTimers[keyName] then state.keyTimers[keyName]:stop(); state.keyTimers[keyName] = nil end
+    if state.repeatTimers[keyName] then state.repeatTimers[keyName]:stop(); state.repeatTimers[keyName] = nil end
+    state.activeKeys[keyName] = nil
+    state.pressContexts[keyName] = nil
+    if isDown and not isRepeat then hs.alert.show("按主页回到 iTerm2", 1) end
+    return true
+  end
+
+  if state.reviewMode and keyName == "back" and isDown then
+    state.reviewMode = false
+    -- Continue to the configured deletion action on this same press.
+  end
 
   -- Window switcher interception when active
   if WindowSwitcher and WindowSwitcher.isVisible and WindowSwitcher.isVisible() then
@@ -788,7 +902,9 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
         end
 
         doStep()
+        local mouseEpoch = state.inputEpoch
         state.mouseTimer = hs.timer.doEvery(0.016, function()
+          if mouseEpoch ~= state.inputEpoch or not state.mouseMode or state.mouseHeldKey ~= keyName then return end
           doStep()
         end)
 
@@ -818,7 +934,7 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       if isRepeat or state.activeKeys[keyName] then
         return true
       end
-      state.activeKeys[keyName] = true
+      state.activeKeys[keyName] = "voice"
       executeAction("action:voice_input", keyName, "down")
       pushEventToDashboard(keyName, "down", "action:voice_input", appTitle)
       return true
@@ -830,7 +946,41 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     end
   end
 
-  local holdMs = (state.config.settings and state.config.settings.holdThresholdMs) or 350
+  -- Repeatable keys fire on down; each key can choose its own repeat cadence.
+  local keyDefs = state.config.profiles[profileName] and state.config.profiles[profileName].keys[keyName]
+  if keyDefs and keyDefs.repeatable then
+    if isDown then
+      if isRepeat or state.activeKeys[keyName] then return true end
+      state.activeKeys[keyName] = true
+      local context = InputTarget.capture()
+      local action = tapAction
+      if state.reviewMode and (keyName == "up" or keyName == "down") then
+        action = keyName == "up" and "key:shift+pageup" or "key:shift+pagedown"
+      end
+      local repeatEpoch = state.inputEpoch
+      local function step()
+        if repeatEpoch ~= state.inputEpoch or not state.activeKeys[keyName] then return false end
+        if state.sessionLocked or not InputTarget.matches(context, InputTarget.capture()) then
+          if state.repeatTimers[keyName] then state.repeatTimers[keyName]:stop(); state.repeatTimers[keyName] = nil end
+          state.activeKeys[keyName] = nil
+          return false
+        end
+        executeAction(action, keyName, "repeat")
+        return true
+      end
+      executeAction(action, keyName, "down")
+      state.repeatTimers[keyName] = hs.timer.doAfter((keyDefs.repeatDelayMs or settings.repeatDelayMs or 350) / 1000, function()
+        if not step() then return end
+        state.repeatTimers[keyName] = hs.timer.doEvery((keyDefs.repeatIntervalMs or settings.repeatIntervalMs or 90) / 1000, step)
+      end)
+    else
+      if state.repeatTimers[keyName] then state.repeatTimers[keyName]:stop(); state.repeatTimers[keyName] = nil end
+      state.activeKeys[keyName] = nil
+    end
+    return true
+  end
+
+  local holdMs = (keyDefs and keyDefs.holdThresholdMs) or settings.holdThresholdMs or 350
   local doubleIntervalMs = (state.config.settings and state.config.settings.doubleClickIntervalMs) or 250
 
   if isDown then
@@ -841,6 +991,11 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     end
 
     state.activeKeys[keyName] = true
+    local context = { profile = profileName, target = InputTarget.capture() }
+    state.pressContexts[keyName] = context
+    local function sameTarget()
+      return keyName == "home" or keyName == "power" or InputTarget.matches(context.target, InputTarget.capture())
+    end
 
     -- Immediate visual feedback on KeyDown in Dashboard
     pushEventToDashboard(keyName, "down", tapAction or "--", appTitle)
@@ -861,8 +1016,8 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       if state.keyTimers[keyName] ~= t then return end
       state.keyTimers[keyName] = nil
       state.pendingDoubleTap[keyName] = nil
-      if state.activeKeys[keyName] then
-        local action = resolveKeyAction(keyName, "hold")
+      if state.activeKeys[keyName] and sameTarget() then
+        local action = resolveKeyAction(keyName, "hold", context.profile)
         executeAction(action, keyName, "hold")
         pushEventToDashboard(keyName, "hold", action, appTitle)
       end
@@ -872,6 +1027,13 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
   else
     -- KeyUp
     state.activeKeys[keyName] = nil
+    local context = state.pressContexts[keyName]
+    state.pressContexts[keyName] = nil
+    if not context or (keyName ~= "home" and keyName ~= "power"
+        and not InputTarget.matches(context.target, InputTarget.capture())) then
+      if state.keyTimers[keyName] then state.keyTimers[keyName]:stop(); state.keyTimers[keyName] = nil end
+      return true
+    end
 
     -- If hold timer was still pending, this was a short press (Tap or Double Tap)
     if state.keyTimers[keyName] ~= nil then
@@ -881,7 +1043,7 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       -- Was this the second tap of a double-tap?
       if state.pendingDoubleTap[keyName] then
         state.pendingDoubleTap[keyName] = nil
-        local doubleAction = resolveKeyAction(keyName, "double_tap")
+        local doubleAction = resolveKeyAction(keyName, "double_tap", context.profile)
         if doubleAction then
           executeAction(doubleAction, keyName, "double_tap")
           pushEventToDashboard(keyName, "double_tap", doubleAction, appTitle)
@@ -890,21 +1052,23 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
       end
 
       -- Check if current profile has double_tap configured for this key
-      local doubleTapAction = resolveKeyAction(keyName, "double_tap")
+      local doubleTapAction = resolveKeyAction(keyName, "double_tap", context.profile)
       if doubleTapAction then
         -- Delay execution to detect potential second tap
         local t
         t = hs.timer.doAfter(doubleIntervalMs / 1000, function()
           if state.doubleTapTimers[keyName] ~= t then return end
           state.doubleTapTimers[keyName] = nil
-          local action = resolveKeyAction(keyName, "tap")
+          if keyName ~= "home" and keyName ~= "power"
+              and not InputTarget.matches(context.target, InputTarget.capture()) then return end
+          local action = resolveKeyAction(keyName, "tap", context.profile)
           executeAction(action, keyName, "tap")
           pushEventToDashboard(keyName, "tap", action, appTitle)
         end)
         state.doubleTapTimers[keyName] = t
       else
         -- No double-tap configured: fire tap immediately with zero delay
-        local action = resolveKeyAction(keyName, "tap")
+        local action = resolveKeyAction(keyName, "tap", context.profile)
         executeAction(action, keyName, "tap")
         pushEventToDashboard(keyName, "tap", action, appTitle)
       end
@@ -914,21 +1078,6 @@ local function handleKeyEvent(keyOrCode, isDown, isRepeat)
     end
     return true
   end
-end
-
-local loggedSuspectCodes = {}
-local function maybeLogSuspectKeycode(keyCode)
-  if not (keyCode >= 144 and keyCode <= 147) then
-    return
-  end
-  if TRANSIT_KEY_MAP[keyCode] then
-    return
-  end
-  if loggedSuspectCodes[keyCode] then
-    return
-  end
-  loggedSuspectCodes[keyCode] = true
-  logToFile("suspect transit keyCode=%d not in TRANSIT_KEY_MAP", keyCode)
 end
 
 -- Setup Global Event Tap
@@ -941,28 +1090,11 @@ local function setupEventTap()
     hs.eventtap.event.types.keyDown,
     hs.eventtap.event.types.keyUp,
   }, function(event)
-    local eventType = event:getType()
-    local keyCode = event:getKeyCode()
-    local isDown = (eventType == hs.eventtap.event.types.keyDown)
-    local isRepeat = event:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) == 1
-
-    -- If remote_hid_listener is active, it authoritative handles all remote buttons
-    -- directly via IOHID (VID/PID isolated). eventtap only needs to consume isolated
-    -- virtual transit keys (F13-F24) so they don't leak into foreground apps.
-    if listenerRunning() then
-      if TRANSIT_KEY_MAP[keyCode] then
-        return true -- eat transit key
-      end
-      maybeLogSuspectKeycode(keyCode)
-      return false -- pass through Mac physical keyboard keys completely untouched
-    end
-
-    -- Fallback when listener binary is not running
-    local eaten = handleKeyEvent(keyCode, isDown, isRepeat)
-    return eaten
+    -- Button identity comes exclusively from IOHID; swallow only inert F20.
+    return TRANSIT_KEY_MAP[event:getKeyCode()] ~= nil
   end)
-  state.eventtap:start()
-  log.i("RemoteControl eventtap started")
+  -- Start only when IOHID reports a connected device, before applying isolation.
+  log.i("RemoteControl eventtap ready; waiting for a device")
 end
 
 -- IOHID helper for keys that hidutil cannot remap (e.g. Back button 0xF1)
@@ -985,6 +1117,9 @@ local function reapOrphanListeners()
 end
 
 local function killOwnListener()
+  clearInputState()
+  state.connectedDeviceCount = 0
+  if state.eventtap then state.eventtap:stop() end
   local task = state.hidTask
   state.hidTask = nil  -- MUST before terminate, so completion is a no-op
   if task ~= nil then
@@ -998,7 +1133,7 @@ local function killOwnListener()
 end
 
 -- IOHID helper for keys that hidutil cannot remap (e.g. Back button 0xF1)
-local function startHidListener()
+local function startHidListener(forceApplyHidutil)
   killOwnListener()
 
   local helperBin = resolveFile("listener", "remote_hid_listener")
@@ -1024,10 +1159,14 @@ local function startHidListener()
       return  -- supervised restart; do not resetHidutil
     end
     state.hidTask = nil
+    clearInputState()
+    state.connectedDeviceCount = 0
     if not state.sessionLocked then
       resetHidutil()
+      if state.eventtap then state.eventtap:stop() end
     end
   end, function(task, stdout, stderr)
+    if state.hidTask ~= taskRef then return false end
     if stdout and stdout ~= "" then
       stdoutBuffer = stdoutBuffer .. stdout
       while true do
@@ -1042,19 +1181,15 @@ local function startHidListener()
               logToFile("hid_key: %s (down=%s)", event.key, tostring(event.down))
               handleKeyEvent(event.key, event.down == true, false)
             elseif event.event == "device_matched" then
+              setDeviceConnected(true)
               logToFile("Remote control connected via IOHID, applying hidutil mapping...")
-              if state.config.device and state.config.device.autoApplyHidutil then
+              if state.sessionLocked or forceApplyHidutil or (state.config.device and state.config.device.autoApplyHidutil) then
                 applyHidutilIfListenerHealthy(vid, pid)
               end
               M.refreshDashboardData()
             elseif event.event == "device_removed" then
               logToFile("Remote control disconnected")
-              for _, t in pairs(state.keyTimers) do t:stop() end
-              state.keyTimers = {}
-              for _, t in pairs(state.doubleTapTimers) do t:stop() end
-              state.doubleTapTimers = {}
-              state.pendingDoubleTap = {}
-              state.activeKeys = {}
+              setDeviceConnected(false)
               M.refreshDashboardData()
             elseif event.error then
               logToFile("hid_error: %s", tostring(event.error))
@@ -1100,16 +1235,15 @@ local function setupDashboard()
       M.refreshDashboardData()
     elseif action == "apply_device" then
       if payload then
+        killOwnListener()
+        resetHidutil() -- clear the old VID/PID before changing the target
         state.config.device = payload
         saveConfig(state.config)
-        startHidListener()
-        local ok = false
-        if listenerRunning() then
-          ok = applyHidutil(payload.vendorID, payload.productID)
-        else
+        startHidListener(true)
+        if not listenerRunning() then
           resetHidutil(payload.vendorID, payload.productID)
         end
-        hs.alert.show(ok and "已重新配置 hidutil 隔离与按键监听" or "hidutil 配置失败，请检查 VID/PID", 2)
+        hs.alert.show(listenerRunning() and "监听已启动，设备连接后自动应用隔离" or "监听启动失败，请检查 VID/PID", 2)
       end
     elseif action == "reset_hidutil" then
       resetHidutil()
@@ -1256,9 +1390,11 @@ end
 
 local function onSessionLock()
   state.sessionLocked = true
-  stopMouseTimer()
-  state.activeKeys = {}
-  applyHidutil()  -- even if listener is down; remotes become F-keys so eventtap can swallow
+  clearInputState(true)
+  if state.connectedDeviceCount > 0 then
+    if state.eventtap then state.eventtap:start() end
+    applyHidutil() -- retain isolation while locked, even if the listener exits
+  end
 end
 
 local function onSessionUnlock()
@@ -1267,6 +1403,7 @@ local function onSessionUnlock()
     applyHidutilIfListenerHealthy()
   else
     resetHidutil()  -- avoid dead keys while unlocked
+    if state.eventtap then state.eventtap:stop() end
   end
 end
 
@@ -1295,14 +1432,6 @@ function M.stop()
   if state.hotkey then state.hotkey:delete(); state.hotkey = nil end
   if state.dashboard then pcall(function() state.dashboard:delete() end); state.dashboard = nil end
   if state.lockWatcher then pcall(function() state.lockWatcher:stop() end); state.lockWatcher = nil end
-  stopMouseTimer()
-  for _, t in pairs(state.keyTimers) do pcall(function() t:stop() end) end
-  state.keyTimers = {}
-  for _, t in pairs(state.doubleTapTimers) do pcall(function() t:stop() end) end
-  state.doubleTapTimers = {}
-  state.pendingDoubleTap = {}
-  state.activeKeys = {}
-  state.mouseMode = false
   resetHidutil()
 end
 
@@ -1315,9 +1444,6 @@ function M.start(options)
   setupEventTap()
   resetHidutil()
   startHidListener()
-  if state.config.device and state.config.device.autoApplyHidutil then
-    applyHidutilIfListenerHealthy()  -- replace raw applyHidutil in PR 2
-  end
   state.hotkey = hs.hotkey.bind({ "alt", "shift" }, "r", function()
     M.toggleDashboard()
   end)
@@ -1382,5 +1508,8 @@ M.currentProfile = currentProfile
 M.rebuildBundleMaps = rebuildBundleMaps
 M.stopMouseTimer = stopMouseTimer
 M._executeAction = executeAction
+M._setDeviceConnected = setDeviceConnected
+M._clearInputState = clearInputState
+M._onSessionLock = onSessionLock
 
 return M

@@ -7,7 +7,31 @@ package.loaded["remote_control"] = nil
 local ok, RC = pcall(require, "modules.remote_control")
 if not ok then RC = require("remote_control") end
 local state = RC._state
-state.config = RC.loadConfig()
+state.config = hs.json.read(root .. "/modules/remote_control/config.json.example")
+-- Tests use a deterministic input target and never depend on desktop focus.
+local InputTarget = require("modules.input_target")
+local originalCapture = InputTarget.capture
+local testTarget = { bundleID = "com.googlecode.iterm2", pid = 1, windowID = 1, element = "pane-1", navigationEpoch = 0 }
+InputTarget.capture = function() return testTarget end
+state.config.settings.targetBundleID = nil
+state._testBundleID = "com.googlecode.iterm2"
+local originalDoAfter, originalDoEvery = hs.timer.doAfter, hs.timer.doEvery
+local originalAlertShow = hs.alert.show
+local visibleAlertsBefore = #hs.alert._visibleAlerts
+local testAlerts = {}
+-- Simulated timers cannot dismiss real drawings; keep test alerts in memory.
+hs.alert.show = function(message)
+  testAlerts[#testAlerts + 1] = message
+  return "test-alert-" .. #testAlerts
+end
+local scheduled = {}
+local function fakeTimer(delay, callback)
+  local t = { delay = delay, callback = callback, stopped = false }
+  function t:stop() self.stopped = true end
+  scheduled[#scheduled + 1] = t
+  return t
+end
+hs.timer.doAfter, hs.timer.doEvery = fakeTimer, fakeTimer
 
 local function assertEq(actual, expected, msg)
   if actual ~= expected then
@@ -54,12 +78,10 @@ for code, name in pairs(unsafeCodes) do
   local mapped = RC.TRANSIT_KEY_MAP and RC.TRANSIT_KEY_MAP[code]
   assertFalse(mapped, "Standard keyboard key " .. name .. " (keycode " .. code .. ") must NOT be in TRANSIT_KEY_MAP!")
 end
--- Verify transit map contains tv (144), volume_up (145), volume_down (146), home (80), power (147)
-assertEq(RC.TRANSIT_KEY_MAP[144], "tv", "TRANSIT_KEY_MAP[144] must be tv")
-assertEq(RC.TRANSIT_KEY_MAP[145], "volume_up", "TRANSIT_KEY_MAP[145] must be volume_up")
-assertEq(RC.TRANSIT_KEY_MAP[146], "volume_down", "TRANSIT_KEY_MAP[146] must be volume_down")
-assertEq(RC.TRANSIT_KEY_MAP[80], "home", "TRANSIT_KEY_MAP[80] must be home (F19)")
-assertEq(RC.TRANSIT_KEY_MAP[147], "power", "TRANSIT_KEY_MAP[147] must be power")
+-- Identity comes from IOHID; only inert F20 is swallowed as an OS transit key.
+assertEq(RC.TRANSIT_KEY_MAP[90], "isolated_remote", "F20 must be isolation-only")
+assertFalse(RC.TRANSIT_KEY_MAP[107], "F14 must not be used as a transit key")
+assertFalse(RC.TRANSIT_KEY_MAP[113], "F15 must not be used as a transit key")
 print("  ✓ Native Mac keyboard keycodes are 100% free from hijacking.")
 
 -- Test 2: Key Stroke Parser and Aliases
@@ -119,37 +141,37 @@ local resolveKeyAction = RC.resolveKeyAction
 
 -- Test with profile override
 local actionOKTap = resolveKeyAction("ok", "tap", "terminal")
-assertEq(actionOKTap, "macro:approve_agent", "Terminal OK tap should resolve to approve_agent")
+assertEq(actionOKTap, "key:return", "Terminal OK tap should be plain Enter")
 
 local actionBackTap = resolveKeyAction("back", "tap", "terminal")
-assertEq(actionBackTap, "key:delete", "Terminal Back tap should resolve to delete")
+assertEq(actionBackTap, "key:delete", "Terminal Back tap should delete")
 
 local actionBackHold = resolveKeyAction("back", "hold", "terminal")
-assertEq(actionBackHold, "key:ctrl+c", "Terminal Back hold should resolve to ctrl+c")
+assertEq(actionBackHold, "key:delete", "Terminal Back hold should repeat deletion")
 
 local actionVolUp = resolveKeyAction("volume_up", "tap", "terminal")
-assertEq(actionVolUp, "macro:tmux_next_window", "Terminal Vol+ should resolve to tmux_next_window")
+assertEq(actionVolUp, "key:pageup", "Terminal Vol+ should send PageUp")
 
 local actionBrowserVolUp = resolveKeyAction("volume_up", "tap", "browser")
-assertEq(actionBrowserVolUp, "key:ctrl+tab", "Browser Vol+ should resolve to ctrl+tab")
+assertEq(actionBrowserVolUp, "key:pageup", "Browser Vol+ mapping should be consistent")
 
 local actionGlobalVolUp = resolveKeyAction("volume_up", "tap", "global")
-assertEq(actionGlobalVolUp, "key:volume_up", "Global Vol+ should resolve to key:volume_up")
+assertEq(actionGlobalVolUp, "key:pageup", "Global Vol+ mapping should be consistent")
 
 local actionTVGlobal = resolveKeyAction("tv", "tap", "global")
-assertEq(actionTVGlobal, "action:toggle_app", "Global TV tap should resolve to toggle_app")
+assertEq(actionTVGlobal, "action:toggle_review", "TV should toggle output review")
 
 local actionTVGlobalHold = resolveKeyAction("tv", "hold", "global")
-assertEq(actionTVGlobalHold, "action:toggle_dashboard", "Global TV hold should resolve to toggle_dashboard")
+assertEq(actionTVGlobalHold, "action:none", "TV hold should do nothing")
 
 local actionHomeGlobal = resolveKeyAction("home", "tap", "global")
-assertEq(actionHomeGlobal, "action:mission_control", "Global Home tap should resolve to mission_control")
+assertEq(actionHomeGlobal, "action:focus_iterm", "Home should focus iTerm2")
 
 local actionPowerTap = resolveKeyAction("power", "tap", "global")
-assertEq(actionPowerTap, "action:display_sleep", "Global Power tap should resolve to display_sleep")
+assertEq(actionPowerTap, "action:none", "Power tap should do nothing")
 
 local actionPowerHold = resolveKeyAction("power", "hold", "global")
-assertEq(actionPowerHold, "action:toggle_mouse_mode", "Global Power hold should resolve to toggle_mouse_mode")
+assertEq(actionPowerHold, "action:toggle_dashboard", "Power hold should open configuration")
 print("  ✓ All profiles (terminal, browser, global) resolve actions correctly.")
 
 -- Test 5: State Machine Repeat De-bounce & Hold Logic
@@ -214,6 +236,9 @@ print("  ✓ Voice hold-to-talk stream started on down and stopped on up.")
 
 -- 5d: Double-Tap detection test (when double_tap is configured)
 executed = {}
+local savedHome = state.config.profiles.global.keys.home
+state.config.profiles.global.keys.home = { tap = "action:mission_control", double_tap = "action:show_desktop" }
+state._testBundleID = "com.test.global"
 -- First tap
 RC.testTriggerKey("home", true, false)
 RC.testTriggerKey("home", false, false)
@@ -241,6 +266,9 @@ assertEq(executed[1].type, "tap", "Action type should be tap")
 assertEq(executed[1].action, "action:mission_control", "Action should resolve to mission_control")
 print("  ✓ Double-tap timeout correctly falls back to single tap.")
 
+state.config.profiles.global.keys.home = savedHome
+state._testBundleID = "com.googlecode.iterm2"
+
 -- Test 6: Mouse Mode & Scroll Wheel
 print("[Test 6] Mouse Mode: Pointer & Scroll Wheel check...")
 state.mouseMode = true
@@ -267,22 +295,17 @@ print("  ✓ FIX-05: hidutil reset command correctly scoped with --matching VID/
 
 -- FIX-03 / FIX-04 / FIX-09: HID table alignment and payload test
 print("[Test 7] HID Mapping Table & Payload validation...")
-local homeDst, volDownDst
-local foundConsumerBack = false
+local foundConsumerBack, foundBrightnessUp, foundBrightnessDown = false, false, false
 for _, row in ipairs(RC.HIDUTIL_MAPPINGS or {}) do
-  if row.key == "home" and row.src == 0x70000004A then
-    homeDst = row.dst
-  elseif row.key == "volume_down" and row.src == 0x700000081 then
-    volDownDst = row.dst
-  end
-  if row.src == 0xC00000224 and row.isolationOnly then
-    foundConsumerBack = true
-  end
+  assertEq(row.dst, 0x70000006F, "Every isolated usage must map to F20")
+  assertTrue(row.isolationOnly, "No OS transit key may dispatch a semantic button")
+  if row.src == 0xC00000224 then foundConsumerBack = true end
+  if row.src == 0xC0000006F then foundBrightnessUp = true end
+  if row.src == 0xC00000070 then foundBrightnessDown = true end
 end
-assertTrue(homeDst ~= nil and volDownDst ~= nil, "home and volume_down must be in HIDUTIL_MAPPINGS")
-assertTrue(homeDst ~= volDownDst, "Home dst and Volume Down dst must be distinct (FIX-09)")
-assertEq(homeDst, 0x70000006E, "Home dst must be F19 0x70000006E")
-assertTrue(foundConsumerBack, "Consumer AC Back 0xC00000224 must be in HIDUTIL_MAPPINGS with isolationOnly (FIX-04)")
+assertTrue(foundConsumerBack, "Consumer Back must be isolated")
+assertTrue(foundBrightnessUp and foundBrightnessDown, "Consumer brightness must be isolated")
+assertTrue(RC.testTriggerKey(90, true, false), "F20 must be swallowed without dispatch")
 
 local payload = RC._hidutilApplyPayload and RC._hidutilApplyPayload()
 assertTrue(type(payload) == "string", "apply payload must be a string")
@@ -293,7 +316,7 @@ assertFalse(payload:find('"keycode"', 1, true) ~= nil, "payload must NOT contain
 assertFalse(payload:find('"key"', 1, true) ~= nil, "payload must NOT contain key")
 
 assertFalse(RC.listenerRunning(), "listenerRunning() must return false when hidTask is nil")
-print("  ✓ HID mapping table, F19 Home, Consumer Back isolation, and payload validated.")
+print("  ✓ F20 isolation, brightness usages, and payload validated.")
 
 -- FIX-16: Session Lock swallowing & login window pass-through
 print("[Test 8] Session Lock Key Suppression check...")
@@ -386,9 +409,273 @@ RC._executeAction("macro:approve_agent", "ok", "tap")
 assertEq(#strokes, 1, "macro:approve_agent must execute when dangerousMacros == true")
 assertEq(strokes[1].key, "y", "macro:approve_agent should press y")
 
+local returnTimer = scheduled[#scheduled]
+returnTimer.callback()
+assertEq(#strokes, 2, "Approval macro timer must be tested while keystrokes are mocked")
+assertEq(strokes[2].key, "return", "Approval macro should finish with Return")
 hs.eventtap.keyStroke = origKeyStroke
 RC._mockExecuteAction = mockExecute
 print("  ✓ dangerousMacros flag properly suppresses agent approval and server restart macros.")
+
+print("[Test 12] Workflow repeat, target guards, and long-press safety...")
+state._testBundleID = "com.googlecode.iterm2"
+for _, pair in ipairs({ { "menu", "key:delete", 0.35, 0.09 }, { "back", "key:delete", 0.35, 0.09 },
+    { "volume_up", "key:pageup", 0.5, 0.25 }, { "volume_down", "key:pagedown", 0.5, 0.25 } }) do
+  executed = {}
+  RC.testTriggerKey(pair[1], true, false)
+  assertEq(#executed, 1, "Delete/page key must execute on down")
+  assertEq(executed[1].action, pair[2], "Repeatable key action mismatch")
+  local delayTimer = state.repeatTimers[pair[1]]
+  assertEq(delayTimer.delay, pair[3], "Per-key repeat delay mismatch")
+  RC.testTriggerKey(pair[1], true, false)
+  assertEq(#executed, 1, "Hardware duplicate must not fire extra delete/page action")
+  delayTimer.callback()
+  assertEq(#executed, 2, "Holding must repeat delete/page action")
+  local repeatTimer = state.repeatTimers[pair[1]]
+  assertEq(repeatTimer.delay, pair[4], "Per-key repeat interval mismatch")
+  RC.testTriggerKey(pair[1], false, false)
+  assertTrue(repeatTimer.stopped, "Releasing must stop repeat")
+  assertEq(#executed, 2, "Releasing must not trigger an extra action")
+end
+executed = {}
+RC.testTriggerKey("left", true, false)
+assertEq(#executed, 1, "Arrow must fire immediately on down")
+assertEq(executed[1].action, "key:left", "Arrow must have no Option modifier")
+local repeatTimer = state.repeatTimers.left
+RC.testTriggerKey("left", true, false)
+assertEq(state.repeatTimers.left, repeatTimer, "Hardware repeats must not add timers")
+repeatTimer.callback()
+assertEq(#executed, 2, "Arrow must repeat after delay")
+local everyTimer = state.repeatTimers.left
+testTarget = { bundleID = "com.googlecode.iterm2", pid = 1, windowID = 1, element = "pane-2", navigationEpoch = 0 }
+everyTimer.callback()
+assertEq(#executed, 2, "Repeat must stop when pane changes")
+assertTrue(everyTimer.stopped, "Repeat timer must stop on target change")
+RC.testTriggerKey("left", false, false)
+
+executed = {}
+RC.testTriggerKey("ok", true, false)
+testTarget = { bundleID = "com.googlecode.iterm2", pid = 1, windowID = 2, element = "pane-2", navigationEpoch = 0 }
+RC.testTriggerKey("ok", false, false)
+assertEq(#executed, 0, "Release in a different window must not submit")
+
+executed = {}
+RC.testTriggerKey("ok", true, false)
+RC.testFireTimer("ok")
+RC.testTriggerKey("ok", false, false)
+assertEq(#executed, 1, "Long OK must submit only once")
+assertEq(executed[1].action, "key:return", "Long OK must not restart a command")
+
+executed = {}
+state.reviewMode = true
+RC.testTriggerKey("back", true, false)
+assertEq(#executed, 1, "Back must delete on the first press even in review mode")
+assertEq(executed[1].action, "key:delete", "Back must send Backspace, never Escape")
+assertFalse(state.reviewMode, "Back must return to input before deleting")
+RC.testTriggerKey("back", false, false)
+assertEq(#executed, 1, "Back release must not add another deletion")
+
+state.config.settings.targetBundleID = "com.googlecode.iterm2"
+state._testBundleID = "com.test.browser"
+executed = {}
+RC.testTriggerKey("ok", true, false)
+RC.testTriggerKey("ok", false, false)
+assertEq(#executed, 0, "Remote must not submit in other apps")
+RC.testTriggerKey("home", true, false)
+RC.testTriggerKey("home", false, false)
+assertEq(executed[1].action, "action:focus_iterm", "Home must remain available outside iTerm2")
+state.config.settings.targetBundleID = nil
+state._testBundleID = "com.googlecode.iterm2"
+
+local a = { bundleID = "com.googlecode.iterm2", pid = 1, windowID = 1, element = "pane-1", navigationEpoch = 0 }
+local b = { bundleID = "com.googlecode.iterm2", pid = 1, windowID = 1, element = "pane-1", navigationEpoch = 1 }
+assertFalse(InputTarget.matches(a, b), "Remote navigation must defer voice output")
+assertTrue(InputTarget.matches(a, b, true), "Explicit recovery can ignore the navigation epoch")
+b.element = "pane-2"
+assertFalse(InputTarget.matches(a, b, true), "Recovery must still require the original input area")
+assertFalse(InputTarget.matches(nil, a), "Missing target must fail closed")
+b.element = a.element
+b.sessionLocked = true
+assertFalse(InputTarget.matches(a, b, true), "Voice output must not paste while locked")
+
+-- Test real dispatcher guards without recording or inserting text.
+local savedVoiceInput = VoiceInput
+local savedStroke = hs.eventtap.keyStroke
+local inserted, sent = 0, 0
+hs.eventtap.keyStroke = function() sent = sent + 1 end
+local epoch = state.navigationEpoch
+state.reviewMode = true
+RC._mockExecuteAction = nil
+RC._executeAction("key:pageup", "volume_up", "down")
+assertEq(state.navigationEpoch, epoch, "Paging must not invalidate the voice target")
+assertTrue(state.reviewMode, "Paging must not exit scrollback mode")
+sent = 0
+VoiceInput = { stopping = true }
+RC._mockExecuteAction = nil
+RC._executeAction("key:return", "ok", "tap")
+assertEq(sent, 0, "OK must not submit while ASR is finalizing")
+VoiceInput = { pastePending = true }
+RC._executeAction("key:return", "ok", "tap")
+assertEq(sent, 0, "OK must wait for delayed clipboard insertion")
+VoiceInput = { pendingText = "preserved", resumePending = function() inserted = inserted + 1 end }
+RC._executeAction("key:return", "ok", "tap")
+assertEq(inserted, 1, "First OK must recover pending text")
+assertEq(sent, 0, "Recovery must not also submit")
+VoiceInput = savedVoiceInput
+hs.eventtap.keyStroke = savedStroke
+RC._mockExecuteAction = mockExecute
+print("  ✓ Repeats, focus changes, single Enter, recovery, and iTerm2-only routing verified.")
+
+print("[Test 13] Disconnect, reconnect and lock cleanup...")
+local tapStarts, tapStops, voiceStops = 0, 0, 0
+state.eventtap = {
+  start = function() tapStarts = tapStarts + 1 end,
+  stop = function() tapStops = tapStops + 1 end,
+}
+VoiceInput = { active = true, stop = function() voiceStops = voiceStops + 1 end }
+state.connectedDeviceCount = 0
+RC._setDeviceConnected(true)
+RC._setDeviceConnected(true)
+assertEq(tapStarts, 1, "Multiple HID services must start the tap only once")
+state.mouseMode = true
+executed = {}
+RC.testTriggerKey("right", true, false)
+local disconnectedMouseTimer = state.mouseTimer
+assertTrue(disconnectedMouseTimer ~= nil, "Mouse movement timer must be active")
+state.keyTimers.power = fakeTimer(0.8, function() end)
+state.doubleTapTimers.home = fakeTimer(0.25, function() end)
+state.repeatTimers.left = fakeTimer(0.09, function() end)
+local hold, double, repeating = state.keyTimers.power, state.doubleTapTimers.home, state.repeatTimers.left
+state.pendingDoubleTap.home = true
+state.activeKeys.voice = "voice"
+state.pressContexts.power = {}
+state.reviewMode = true
+RC._setDeviceConnected(false)
+assertFalse(disconnectedMouseTimer.stopped, "Removing one HID service must not stop a still-connected remote")
+RC._setDeviceConnected(false)
+assertTrue(disconnectedMouseTimer.stopped, "Disconnect must stop mouse movement")
+assertTrue(hold.stopped and double.stopped and repeating.stopped, "Disconnect must stop every input timer")
+assertEq(state.mouseTimer, nil, "Mouse timer must be released")
+assertEq(state.mouseHeldKey, nil, "Held mouse direction must be cleared")
+for _, name in ipairs({ "keyTimers", "doubleTapTimers", "repeatTimers", "pendingDoubleTap", "activeKeys", "pressContexts" }) do
+  assertEq(next(state[name]), nil, "Disconnect must clear " .. name)
+end
+assertFalse(state.mouseMode or state.reviewMode, "Disconnect must reset temporary modes")
+assertEq(voiceStops, 1, "Disconnect must finish a remote voice press")
+assertEq(tapStops, 1, "Disconnect must suspend the keyboard tap")
+local actionCount = #executed
+disconnectedMouseTimer.callback()
+assertEq(#executed, actionCount, "A stale mouse callback must not move after disconnect")
+RC._setDeviceConnected(true)
+assertEq(tapStarts, 2, "Reconnect must resume the keyboard tap")
+state.mouseMode = true
+RC.testTriggerKey("right", true, false)
+actionCount = #executed
+disconnectedMouseTimer.callback()
+assertEq(#executed, actionCount, "A stale callback must not affect a new mouse press")
+RC._setDeviceConnected(false)
+assertEq(voiceStops, 1, "Disconnect must preserve voice started from the keyboard")
+
+-- Lock must cancel pending power holds and double taps without executing them.
+state.mouseMode = false
+executed = {}
+RC.testTriggerKey("power", true, false)
+local lockedHold = state.keyTimers.power
+state.doubleTapTimers.home = fakeTimer(0.25, function() end)
+local lockedDouble = state.doubleTapTimers.home
+RC._onSessionLock()
+assertTrue(lockedHold.stopped and lockedDouble.stopped, "Lock must cancel holds and double taps")
+lockedHold.callback()
+assertEq(#executed, 0, "A stale power hold must not open a panel while locked")
+assertEq(voiceStops, 2, "Lock must stop active voice regardless of its entry point")
+state.sessionLocked = false
+state.eventtap = nil
+VoiceInput = savedVoiceInput
+
+-- A repeat delay already queued before cleanup must not restart repetition.
+executed = {}
+RC.testTriggerKey("left", true, false)
+local disconnectedRepeat = state.repeatTimers.left
+RC._clearInputState()
+RC.testTriggerKey("left", true, false)
+local newRepeat = state.repeatTimers.left
+actionCount = #executed
+disconnectedRepeat.callback()
+assertEq(#executed, actionCount, "A stale repeat must not execute after reconnect")
+assertEq(state.repeatTimers.left, newRepeat, "A stale delay must not replace the new repeat timer")
+RC._clearInputState()
+print("  ✓ Disconnect stops all input; reconnect resumes listening; lock cancels queued actions.")
+
+print("[Test 14] IOHID task lifecycle and idle keyboard tap...")
+local originalExecute, originalTaskNew = hs.execute, hs.task.new
+local originalTapNew, originalHotkeyBind = hs.eventtap.new, hs.hotkey.bind
+local originalWatcherNew, originalAttributes = hs.caffeinate.watcher.new, hs.fs.attributes
+local originalShutdown = hs.shutdownCallback
+local tasks, lifecycleTap, lockCallback = {}, nil, nil
+hs.execute = function() return "", true end
+hs.fs.attributes = function(path, attr)
+  if path:match("/listener$") then return "file" end
+  return originalAttributes(path, attr)
+end
+hs.task.new = function(_, complete, stream)
+  local task = { complete = complete, stream = stream, running = false }
+  function task:isRunning() return self.running end
+  function task:start() self.running = true; return true end
+  function task:terminate() self.running = false end
+  function task:pid() return nil end
+  tasks[#tasks + 1] = task
+  return task
+end
+hs.eventtap.new = function(_, callback)
+  lifecycleTap = { enabled = false, callback = callback }
+  function lifecycleTap:start() self.enabled = true end
+  function lifecycleTap:stop() self.enabled = false end
+  return lifecycleTap
+end
+hs.hotkey.bind = function() return { delete = function() end } end
+hs.caffeinate.watcher.new = function(callback)
+  lockCallback = callback
+  return { start = function() end, stop = function() end }
+end
+local function emit(task, event)
+  return task.stream(task, hs.json.encode({ event = event }) .. "\n", "")
+end
+RC.start()
+assertFalse(lifecycleTap.enabled, "Starting without a device must leave the tap idle")
+emit(tasks[1], "device_matched")
+assertTrue(lifecycleTap.enabled, "A matching device must enable isolation")
+assertTrue(lifecycleTap.callback({ getKeyCode = function() return 90 end }), "F20 must be swallowed")
+assertFalse(lifecycleTap.callback({ getKeyCode = function() return 36 end }), "Physical Return must pass through")
+state.mouseMode = true
+RC.testTriggerKey("right", true, false)
+local exitedMouseTimer = state.mouseTimer
+tasks[1].running = false
+tasks[1].complete(1, "", "failure")
+assertTrue(exitedMouseTimer.stopped, "A listener failure must stop mouse movement")
+assertFalse(lifecycleTap.enabled, "An unlocked listener failure must disable the keyboard tap")
+assertEq(state.connectedDeviceCount, 0, "A failed listener must clear connection state")
+
+RC.start()
+local oldTask = tasks[2]
+emit(oldTask, "device_matched")
+RC.start()
+assertFalse(lifecycleTap.enabled, "Restart must wait for a fresh device notification")
+assertFalse(emit(oldTask, "device_matched"), "A superseded listener must not deliver input")
+oldTask.complete(0, "", "")
+assertEq(state.hidTask, tasks[3], "An old completion must not clear the replacement listener")
+emit(tasks[3], "device_matched")
+RC._onSessionLock()
+tasks[3].running = false
+tasks[3].complete(1, "", "failure")
+assertTrue(lifecycleTap.enabled, "A locked listener failure must retain key isolation")
+lockCallback(hs.caffeinate.watcher.screensDidUnlock)
+assertFalse(lifecycleTap.enabled, "Unlock after listener failure must release isolation")
+RC.stop()
+hs.execute, hs.task.new = originalExecute, originalTaskNew
+hs.eventtap.new, hs.hotkey.bind = originalTapNew, originalHotkeyBind
+hs.caffeinate.watcher.new, hs.fs.attributes = originalWatcherNew, originalAttributes
+hs.shutdownCallback = originalShutdown
+print("  ✓ Idle tap, real task callbacks, failure cleanup, stale tasks and locked isolation verified.")
 
 -- Teardown (Algorithm G): stop all timers before clearing mock, so background timers never fire to real desktop
 for _, t in pairs(state.keyTimers or {}) do pcall(function() t:stop() end) end
@@ -405,10 +692,17 @@ end
 state.mouseMode = false
 state.sessionLocked = false
 
+for _, t in pairs(state.repeatTimers) do t:stop() end
+state.repeatTimers = {}
+InputTarget.capture = originalCapture
+hs.timer.doAfter, hs.timer.doEvery = originalDoAfter, originalDoEvery
+hs.alert.show = originalAlertShow
+assertEq(#hs.alert._visibleAlerts, visibleAlertsBefore, "Tests must not leave visible alerts")
+
 -- Restore hook only after timers are stopped
 RC._mockExecuteAction = nil
 
 print("\n=======================================================")
-print("ALL TESTS PASSED: Remote Control Engine is 100% verified!")
+print("ALL TESTS PASSED: Remote Control Engine regression checks passed.")
 print("=======================================================")
 return true

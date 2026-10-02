@@ -19,3 +19,6 @@ remote_hid_listener
 .venv/
 __pycache__/
 *.pyc
+
+# Local workflow rollback snapshots (may contain personal config)
+backups/

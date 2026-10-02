@@ -12,6 +12,7 @@
 -- not part of the project defaults. ~/.hammerspoon/voice_hotwords.lua
 -- is only a fallback if the module file is missing.
 local M = {}
+local InputTarget = require("modules.input_target")
 
 local log = hs.logger.new("voice-input", "debug")
 local API_KEY_ENV = "HAMMERSPOON_VOICE_DOUBAO_API_KEY"
@@ -1180,6 +1181,10 @@ function M.start(options)
     pendingFinal = false,
     finalStarted = false,
     autoPaste = options.autoPaste ~= false,
+    inputTarget = nil,
+    pendingText = nil,
+    pendingTarget = nil,
+    pastePending = false,
     apiKey = resolveApiKey(options.apiKey),
     resourceID = options.resourceID or DEFAULT_RESOURCE_ID,
     flashURL = options.flashURL or DEFAULT_FLASH_URL,
@@ -1507,11 +1512,22 @@ function M.start(options)
     if not state.autoPaste or text == "" then
       return
     end
+    state.pastePending = true
     afterModifiersClear(function()
+      state.pastePending = false
       if state.generation ~= gen then
         return
       end
       dbg("insert caret text_len=%d", #text)
+      if not InputTarget.matches(state.inputTarget, InputTarget.capture()) then
+        state.pendingText = text
+        state.pendingTarget = state.inputTarget
+        state.ui:setStatus("目标已变化：回原输入区，按 OK 插入")
+        state.ui:setTranscript(text)
+        state.ui:show()
+        hs.alert.show("转录已保留，回到原输入区后按 OK 插入", 3)
+        return
+      end
       insertAtCaret(text)
     end)
   end
@@ -2029,6 +2045,15 @@ function M.start(options)
       dbg("start ignored already_active")
       return
     end
+    if state.pendingText then
+      hs.alert.show("先回原输入区按 OK 插入上一段转录", 2)
+      return
+    end
+    if state.stopping or state.pastePending then
+      hs.alert.show("正在完成上一段语音，请稍候", 1)
+      return
+    end
+    state.inputTarget = InputTarget.capture()
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
       if pid ~= nil then
@@ -2214,6 +2239,20 @@ function M.start(options)
   end
   state.isActive = function()
     return state.active
+  end
+  state.resumePending = function()
+    if not state.pendingText then return false end
+    if not InputTarget.matches(state.pendingTarget, InputTarget.capture(), true) then
+      hs.alert.show("请回到录音开始时的窗口和输入区", 2)
+      return false
+    end
+    local text = state.pendingText
+    state.pendingText = nil
+    state.pendingTarget = nil
+    state.ui:hide()
+    insertAtCaret(text)
+    hs.alert.show("已插入转录，再按 OK 发送", 1.5)
+    return true
   end
   state.debugLogPath = DEBUG_LOG
   dbg("lexicon ready path=%s hotwords=%d replacements=%d",
