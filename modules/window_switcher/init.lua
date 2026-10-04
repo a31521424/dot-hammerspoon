@@ -242,14 +242,6 @@ local function makeWindowPredicate(config, ignored)
   end
 end
 
-local function bindOrFail(modifiers, key, pressed, repeated)
-  local hotkey = hs.hotkey.bind(modifiers, key, pressed, nil, repeated)
-  if hotkey == nil then
-    error(string.format("could not bind %s+%s", table.concat(modifiers, "+"), key), 3)
-  end
-  return hotkey
-end
-
 local function clamp(value, minimum, maximum)
   return math.max(minimum, math.min(maximum, value))
 end
@@ -432,6 +424,7 @@ local function attachClickCallbacks(switcher)
     local windowIndex = index
     local item = switcher.drawings[index]
     local callback = function()
+      if switcher.takeOverInput then switcher.takeOverInput() end
       clickWindow(switcher, windowIndex)
     end
 
@@ -455,6 +448,7 @@ local function attachClickCallbacks(switcher)
   -- its own callback and resolves the current index at click time.
   switcher.drawings.highlightRect:setClickCallback(function()
     if switcher.selected ~= nil then
+      if switcher.takeOverInput then switcher.takeOverInput() end
       clickWindow(switcher, switcher.selected)
     end
   end)
@@ -462,6 +456,7 @@ end
 
 function M.start(options)
   options = options or {}
+  if M._instance then M._instance:stop() end
   local config = {
     includeMinimized = options.includeMinimized ~= false,
     includeHidden = options.includeHidden == true,
@@ -481,10 +476,35 @@ function M.start(options)
   local sessionScreen
   local activatingScreen
   local layoutRepairTimer = nil
+  local sessionSource
+  local commandWorkTimer
+  local commandActions = {}
+  local sessionGesture
+  local commandCutoff = -math.huge
+  local latestGesture = 0
+  local gestureRecords = {}
+  local nativeDriver
+
+  local function discardCommandActions()
+    commandActions = {}
+    if commandWorkTimer ~= nil then
+      commandWorkTimer:stop()
+      commandWorkTimer = nil
+    end
+  end
+
+  local function takeOverInput()
+    discardCommandActions()
+    commandCutoff = hs.timer.absoluteTime() / 1000000000
+    gestureRecords = {}
+  end
 
   local function clearSession()
     sessionScreen = nil
     activatingScreen = nil
+    sessionSource = nil
+    if nativeDriver then nativeDriver:setSessionActive(false, sessionGesture) end
+    sessionGesture = nil
     if layoutRepairTimer ~= nil then
       layoutRepairTimer:stop()
       layoutRepairTimer = nil
@@ -563,6 +583,7 @@ function M.start(options)
     "warning"
   )
   switcher.clearSession = clearSession
+  switcher.takeOverInput = takeOverInput
 
   local function prepareListLayout(wasFresh)
     if not wasFresh then
@@ -593,10 +614,10 @@ function M.start(options)
   end
 
   local function isStaleQueuedActivation()
-    -- If user is no longer holding Alt when a fresh activation is dispatched,
-    -- this is a stale buffered event from event queue backlog.
+    -- Direct API calls without a source only activate while Command is held.
+    -- Native actions already carry their original gesture and bypass this guard.
     local mods = hs.eventtap.checkKeyboardModifiers(true)
-    if mods == nil or not mods.alt then
+    if mods == nil or not mods.cmd then
       return true
     end
     return false
@@ -605,12 +626,14 @@ function M.start(options)
   local function cycleWindow(backwards, opts)
     opts = (type(opts) == "table" and opts) or {}
     local remote = opts.source == "remote"
+    local command = not remote
     local wasFresh = switcher.windows == nil
-    if wasFresh and (not remote) and isStaleQueuedActivation() then
+    if wasFresh and opts.source == nil and isStaleQueuedActivation() then
       clearSession()
       return
     end
     if wasFresh then
+      sessionSource = remote and "remote" or "command"
       sessionScreen = currentScreen()
       activatingScreen = sessionScreen
       -- The native switcher caches layout by window count. Invalidate it even
@@ -625,11 +648,21 @@ function M.start(options)
     else
       switcher:next()
     end
-    if remote then
+    if remote or command then
       if switcher.modsTimer ~= nil then
         pcall(function() switcher.modsTimer:stop() end)
         switcher.modsTimer = nil
       end
+    end
+    if remote then
+      takeOverInput()
+      sessionSource = "remote"
+      if nativeDriver then nativeDriver:setSessionActive(false, sessionGesture) end
+      sessionGesture = nil
+    elseif switcher.windows ~= nil then
+      sessionSource = "command"
+      sessionGesture = opts.gesture
+      if nativeDriver then nativeDriver:setSessionActive(true, sessionGesture) end
     end
     activatingScreen = nil
     if switcher.windows == nil then
@@ -638,28 +671,115 @@ function M.start(options)
     prepareListLayout(wasFresh)
   end
 
-  local function nextWindow()
-    cycleWindow(false)
-  end
-
-  local function previousWindow()
-    cycleWindow(true)
-  end
-
   local controller = {
     baseFilter = windowFilter,
     windowFilter = windowFilter,
     switcher = switcher,
-    hotkeys = {
-      next = bindOrFail({ "alt" }, "tab", nextWindow, nextWindow),
-      previous = bindOrFail(
-        { "alt", "shift" },
-        "tab",
-        previousWindow,
-        previousWindow
-      ),
-    },
+    hotkeys = {}, -- Command shortcuts are owned exclusively by the native helper.
   }
+
+  local function focusTarget(target)
+    local ok, err = pcall(function()
+      target:unminimize(); target:raise(); target:focus()
+    end)
+    if not ok then log.ef("could not focus command target: %s", err) end
+  end
+
+  local function enqueueCommand(event)
+    commandActions[#commandActions + 1] = event
+    if commandWorkTimer ~= nil then return end
+    -- All native actions and releases share one stream. AX and drawing remain
+    -- deferred, and every confirmation is scoped to its original gesture.
+    commandWorkTimer = hs.timer.doAfter(0, function()
+      commandWorkTimer = nil
+      local actions = commandActions
+      commandActions = {}
+      for _, pending in ipairs(actions) do
+        local ok, err = pcall(function()
+          if pending.started <= commandCutoff or pending.gesture < latestGesture then return end
+          local record = gestureRecords[pending.gesture]
+          if not record then
+            record = {}
+            gestureRecords[pending.gesture] = record
+            gestureRecords[pending.gesture - 64] = nil
+          end
+          if pending.event == "next" or pending.event == "previous" then
+            latestGesture = pending.gesture
+            if record.cancelled and pending.repeated then return end
+            if record.cancelled then record = {}; gestureRecords[pending.gesture] = record end
+            if not record.initialized then
+              record.original = hs.window.focusedWindow()
+              record.initialized = true
+            end
+            local backwards = pending.event == "previous"
+            if record.closed and record.windows then
+              -- Carbon may deliver several steps after the modifier release.
+              -- Continue the original candidate snapshot, never a fresh MRU list.
+              record.selected = ((record.selected - 1 + (backwards and -1 or 1)) % #record.windows) + 1
+              focusTarget(record.windows[record.selected])
+              return
+            end
+            if sessionSource == "command" and sessionGesture ~= pending.gesture then
+              clickWindow(switcher, switcher.selected)
+            end
+            cycleWindow(backwards, { source = "command", gesture = pending.gesture })
+            record.windows = switcher.windows
+            record.selected = switcher.selected
+            if record.closed and sessionGesture == pending.gesture then
+              clickWindow(switcher, switcher.selected)
+            end
+          elseif pending.event == "confirm" then
+            record.closed = true
+            if sessionSource == "command" and sessionGesture == pending.gesture then
+              record.windows, record.selected = switcher.windows, switcher.selected
+              clickWindow(switcher, switcher.selected)
+            end
+          elseif pending.event == "cancel" then
+            record.cancelled = true
+            if record.closed and record.original then
+              -- Escape can arrive after the modifier-release confirmation.
+              -- Restore this gesture's original focus without touching newer ones.
+              focusTarget(record.original)
+            end
+            if sessionSource == "command" and sessionGesture == pending.gesture then
+              dismissWithoutFocus(switcher)
+            end
+          end
+        end)
+        if not ok then
+          dismissWithoutFocus(switcher)
+          discardCommandActions()
+          log.ef("Command-Tab action failed: %s", err)
+          break
+        end
+      end
+    end)
+  end
+
+  if options.nativeCommandTab == true then
+    controller.commandStats = { presses = 0, repeats = 0 }
+    nativeDriver = require("modules.window_switcher.native_hotkeys").start({ onAction = function(event)
+      if type(event.gesture) ~= "number" or type(event.started) ~= "number"
+        or event.started <= commandCutoff then return end
+      if event.event == "next" or event.event == "previous" then
+        local stat = event.repeated == true and "repeats" or "presses"
+        controller.commandStats[stat] = controller.commandStats[stat] + 1
+      end
+      enqueueCommand(event)
+    end, onUnavailable = function()
+      takeOverInput()
+      dismissWithoutFocus(switcher)
+    end })
+    controller.nativeHotkeys = nativeDriver
+    if not M._shutdownInstalled then
+      local previousShutdown = hs.shutdownCallback
+      hs.shutdownCallback = function()
+        M.stop()
+        if type(previousShutdown) == "function" then previousShutdown() end
+      end
+      M._shutdownInstalled = true
+    end
+  end
 
   function controller.candidateCount(self)
     local filter = (type(self) == "table" and self.windowFilter) or windowFilter
@@ -685,18 +805,22 @@ function M.start(options)
   end
 
   function controller.clickIndex(self, index)
+    takeOverInput()
     local actualIndex = index or self
     clickWindow(switcher, actualIndex)
   end
 
   function controller.cancel()
+    takeOverInput()
     dismissWithoutFocus(switcher)
     clearSession()
   end
 
   function controller.stop(self)
+    takeOverInput()
     dismissWithoutFocus(switcher)
     clearSession()
+    if nativeDriver then nativeDriver:stop() end
     local target = (type(self) == "table" and self) or controller
     for _, hotkey in pairs(target.hotkeys or {}) do
       hotkey:delete()
@@ -705,9 +829,15 @@ function M.start(options)
     if windowFilter ~= nil then
       windowFilter:pause()
     end
+    if M._instance == controller then M._instance = nil end
   end
 
+  M._instance = controller
   return controller
+end
+
+function M.stop()
+  if M._instance then M._instance:stop() end
 end
 
 return M

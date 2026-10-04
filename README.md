@@ -36,14 +36,32 @@
 │   │   └── secret.lua                 # 本地 API Key（git 忽略）
 │   │
 │   └── window_switcher/               # 窗口切换模块
-│       └── init.lua                   # 垂直 Alt-Tab 渲染与排序
+│       ├── init.lua                   # 垂直 Alt-Tab 渲染与排序
+│       ├── native_hotkeys.lua         # 原生快捷键进程管理
+│       └── native_guard.swift         # Carbon 快捷键与系统入口恢复
 │
 └── tests/                             # 自动化测试
     ├── remote_control_test.lua        # 遥控器状态机与按键隔离测试
-    └── window_switcher_test.lua       # 窗口切换器多屏过滤测试
+    ├── window_switcher_test.lua       # 窗口切换器多屏过滤测试
+    ├── native_hotkeys_test.lua        # 原生快捷键进程管理测试
+    ├── native_gestures_test.py        # 原始时间与手势归属测试
+    └── native_guard_test.py           # 系统入口恢复集成测试
 ```
 
 ---
+
+## 窗口切换快捷键
+
+- `Command + Tab`：下一个窗口；`Command + Shift + Tab`：上一个窗口。松开 Command 确认，即使 Shift 仍按住；Esc 取消。
+- 只注册这一组窗口切换快捷键；`Option + Tab`／`Option + Shift + Tab` 不再绑定。也可鼠标点击选择窗口。
+
+`init.lua` 中的 `nativeCommandTab = true` 启用原生快捷键。参考 [AltTab 的实现](https://github.com/lwouis/alt-tab-macos/blob/master/src/events/KeyboardEvents.swift)，辅助进程通过 SkyLight 私有 API 暂停系统 Command+Tab／Command+Shift+Tab，再用 Carbon `RegisterEventHotKey` 注册两个组合键。无需手动改系统设置或键盘映射；密码框开启 Secure Input 时仍使用同一套窗口切换流程。窗口筛选、排序和跟随鼠标所在显示器的行为保持不变。
+
+原生辅助进程记录每次 Command 按住和松开的原始时间，并将 Carbon 按键关联到对应手势。普通输入下，只观察 Command+Tab 的键码、方向和时间来校正其他监听器造成的延迟，不读取或保存文字；Secure Input 隐藏原始 Tab 时使用 Carbon 路径。Carbon 是唯一触发入口。同步标记确保先处理已有修饰键通知再确定手势；无法确定归属或同步失败时恢复系统入口。触发、取消和确认从同一消息流发送，Lua 按手势编号处理，避免快速连按时串会话。迟到的同一次手势仍沿用原窗口列表；遥控器或鼠标接管时清除排队动作，并拒绝旧手势的迟到消息。窗口枚举、绘图和确认选择在输入回调之外执行。辅助进程首次运行或源文件更新时自动编译，需要 Apple Command Line Tools；编译或注册失败时恢复系统 Command+Tab。
+
+辅助进程记录系统入口原来的启用状态；停止模块、重新加载或 Hammerspoon 退出时恢复。辅助进程被强制结束时，由 Hammerspoon 恢复；若两者同时被强制结束，下次启动从记录恢复。设为 `nativeCommandTab = false` 并重新加载后恢复系统入口。这里使用私有 API，macOS 升级后需重新验证。
+
+实体键盘验收：按住 Command 连按 Tab、长按 Tab、加 Shift 反向选择后先松 Command、快速轻按组合键、Esc 取消、密码框内切换、鼠标点击、普通 Tab 与 Option+W，并确认 Option+Tab 不再触发本切换器。自动化测试覆盖状态和清理，合成按键测试不能替代实体键盘手感验证。
 
 ## 遥控器键位映射（iTerm2 SSH Agent 体验版）
 
@@ -122,7 +140,14 @@ hs -c "return dofile(hs.configdir .. '/tests/remote_control_test.lua')"
 
 # 运行窗口切换器测试
 hs -c "return dofile(hs.configdir .. '/tests/window_switcher_test.lua')"
+
+# 原生快捷键进程管理测试（使用模拟进程，不改变系统入口）
+hs -c "return dofile(hs.configdir .. '/tests/native_hotkeys_test.lua')"
 ```
+
+`python3 tests/native_gestures_test.py` 编译并测试实际 Swift 手势状态机，不修改系统入口。
+
+`tests/native_guard_test.py` 在 macOS 上验证真实系统入口的恢复。先执行 `hs -c 'WindowSwitcher:stop()'`，再运行 `python3 tests/native_guard_test.py`；测试结束后重新加载配置以启用切换器。
 
 ---
 

@@ -9,6 +9,8 @@ remote_config.json
 # Binaries & build artifacts
 remote_hid_listener
 **/listener
+**/native_guard
+modules/window_switcher/.native-hotkeys.json*
 
 # Runtime logs
 *.log

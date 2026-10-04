@@ -14,6 +14,7 @@ package.path = configDir .. "/modules/?.lua;"
 -- Keep this global so Hammerspoon does not garbage-collect the switcher,
 -- window filter, or hotkeys.
 WindowSwitcher = require("modules.window_switcher").start({
+  nativeCommandTab = true,
   -- Match Windows-style Alt-Tab: minimized windows are valid targets, while
   -- Cmd-H hidden applications stay out of the list.
   includeMinimized = true,
