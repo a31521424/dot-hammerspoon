@@ -9,10 +9,12 @@
 -- captured again by the microphone.
 -- Customize recall words in modules/voice_input/hotwords.lua
 -- (copy from hotwords.lua.example). That file is local and is
--- not part of the project defaults. ~/.hammerspoon/voice_hotwords.lua
--- is only a fallback if the module file is missing.
+-- not part of the project defaults.
 local M = {}
-local InputTarget = require("modules.input_target")
+local okTarget, InputTarget = pcall(require, "modules.input_target")
+if not okTarget or type(InputTarget) ~= "table" then
+  InputTarget = nil
+end
 
 local log = hs.logger.new("voice-input", "debug")
 local API_KEY_ENV = "HAMMERSPOON_VOICE_DOUBAO_API_KEY"
@@ -25,18 +27,8 @@ local moduleDir = (function()
   return (hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/modules/voice_input/"
 end)() or ((hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/modules/voice_input/")
 
-local function resolveModuleFile(relName, legacyRootName)
-  local localPath = moduleDir .. relName
-  if hs.fs.attributes(localPath, "mode") == "file" then
-    return localPath
-  end
-  if legacyRootName then
-    local rootPath = (hs.configdir or os.getenv("HOME") .. "/.hammerspoon") .. "/" .. legacyRootName
-    if hs.fs.attributes(rootPath, "mode") == "file" then
-      return rootPath
-    end
-  end
-  return localPath
+local function resolveModuleFile(relName)
+  return moduleDir .. relName
 end
 
 local DEBUG_LOG = moduleDir .. "debug.log"
@@ -132,7 +124,7 @@ local function configDir()
 end
 
 local function defaultLexiconPath()
-  return resolveModuleFile("hotwords.lua", "voice_hotwords.lua")
+  return resolveModuleFile("hotwords.lua")
 end
 
 local function copyFile(src, dst)
@@ -158,7 +150,7 @@ local function ensureLexiconFile(path)
   if hs.fs.attributes(path, "mode") == "file" then
     return path
   end
-  local example = resolveModuleFile("hotwords.lua.example", "voice_hotwords.lua.example")
+  local example = resolveModuleFile("hotwords.lua.example")
   if hs.fs.attributes(example, "mode") == "file" and copyFile(example, path) then
     return path
   end
@@ -1035,7 +1027,7 @@ local function recognizeWav(options, wavBytes, callback)
 end
 
 local function reapOrphanDaemons(socketPath)
-  local script = resolveModuleFile("stream.py", "voice_stream.py")
+  local script = resolveModuleFile("stream.py")
   local out = hs.execute("/bin/ps -Ao pid=,comm=,args=") or ""
   for line in out:gmatch("[^\n]+") do
     local pid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
@@ -1181,6 +1173,7 @@ function M.start(options)
     pendingFinal = false,
     finalStarted = false,
     autoPaste = options.autoPaste ~= false,
+    guardInputTarget = options.guardInputTarget,
     inputTarget = nil,
     pendingText = nil,
     pendingTarget = nil,
@@ -1198,7 +1191,7 @@ function M.start(options)
     streamPython = executable({
       (hs.configdir or (os.getenv("HOME") .. "/.hammerspoon")) .. "/.venv/bin/python",
     }),
-    streamScript = resolveModuleFile("stream.py", "voice_stream.py"),
+    streamScript = resolveModuleFile("stream.py"),
     ffmpeg = options.ffmpegPath or executable({ "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" }),
     audioDevice = options.audioDevice,
     audioTask = nil,
@@ -1231,6 +1224,13 @@ function M.start(options)
     didAlertFlashFallback = false,
     ui = makeUI(),
   }
+
+  local function shouldGuardTarget()
+    if state.guardInputTarget ~= nil then
+      return state.guardInputTarget == true and InputTarget ~= nil
+    end
+    return InputTarget ~= nil and RemoteControl ~= nil
+  end
 
   local function stopTimers()
     if state.levelTimer ~= nil then
@@ -1519,7 +1519,7 @@ function M.start(options)
         return
       end
       dbg("insert caret text_len=%d", #text)
-      if not InputTarget.matches(state.inputTarget, InputTarget.capture()) then
+      if shouldGuardTarget() and not InputTarget.matches(state.inputTarget, InputTarget.capture()) then
         state.pendingText = text
         state.pendingTarget = state.inputTarget
         state.ui:setStatus("目标已变化：回原输入区，按 OK 插入")
@@ -2045,15 +2045,17 @@ function M.start(options)
       dbg("start ignored already_active")
       return
     end
-    if state.pendingText then
+    if shouldGuardTarget() and state.pendingText then
       hs.alert.show("先回原输入区按 OK 插入上一段转录", 2)
       return
     end
+    state.pendingText = nil
+    state.pendingTarget = nil
     if state.stopping or state.pastePending then
       hs.alert.show("正在完成上一段语音，请稍候", 1)
       return
     end
-    state.inputTarget = InputTarget.capture()
+    state.inputTarget = shouldGuardTarget() and InputTarget.capture() or nil
     if state.audioTask ~= nil and state.audioTask:isRunning() then
       local pid = state.audioTask:pid()
       if pid ~= nil then
@@ -2242,7 +2244,7 @@ function M.start(options)
   end
   state.resumePending = function()
     if not state.pendingText then return false end
-    if not InputTarget.matches(state.pendingTarget, InputTarget.capture(), true) then
+    if shouldGuardTarget() and not InputTarget.matches(state.pendingTarget, InputTarget.capture(), true) then
       hs.alert.show("请回到录音开始时的窗口和输入区", 2)
       return false
     end

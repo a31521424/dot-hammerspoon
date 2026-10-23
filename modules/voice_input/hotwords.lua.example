@@ -2,8 +2,6 @@
 -- hotwords.lua is ignored by Git and is not part of the project.
 --
 -- Path: ~/.hammerspoon/modules/voice_input/hotwords.lua
--- Fallback (only if the file above is missing):
---   ~/.hammerspoon/voice_hotwords.lua
 -- After editing, reload Hammerspoon (Reload Config).
 --
 -- hotwords: sent to streaming ASR and the final Flash pass.

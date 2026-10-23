@@ -9,7 +9,22 @@
 --   - Persistent Control Panel (Dashboard) via hs.webview
 
 local M = {}
-local InputTarget = require("modules.input_target")
+local okTarget, InputTarget = pcall(require, "modules.input_target")
+if not okTarget or type(InputTarget) ~= "table" then
+  InputTarget = {
+    capture = function()
+      return {
+        navigationEpoch = RemoteControl and RemoteControl._state.navigationEpoch or 0,
+        sessionLocked = RemoteControl and RemoteControl._state.sessionLocked or false,
+      }
+    end,
+    matches = function(expected, actual, ignoreNavigation)
+      if not expected or not actual then return true end
+      if actual.sessionLocked then return false end
+      return ignoreNavigation or expected.navigationEpoch == actual.navigationEpoch
+    end,
+  }
+end
 
 local log = hs.logger.new("remote-ctrl", "debug")
 local configDir = hs.configdir or ((os.getenv("HOME") or "") .. "/.hammerspoon")
@@ -21,23 +36,13 @@ local moduleDir = (function()
   return configDir .. "/modules/remote_control/"
 end)() or (configDir .. "/modules/remote_control/")
 
-local function resolveFile(relName, legacyRootName)
-  local localPath = moduleDir .. relName
-  if hs.fs.attributes(localPath, "mode") == "file" then
-    return localPath
-  end
-  if legacyRootName then
-    local rootPath = configDir .. "/" .. legacyRootName
-    if hs.fs.attributes(rootPath, "mode") == "file" then
-      return rootPath
-    end
-  end
-  return localPath
+local function resolveFile(relName)
+  return moduleDir .. relName
 end
 
-local CONFIG_FILE = resolveFile("config.json", "remote_config.json")
-local EXAMPLE_FILE = resolveFile("config.json.example", "remote_config.json.example")
-local DASHBOARD_HTML = resolveFile("dashboard.html", "remote_dashboard.html")
+local CONFIG_FILE = resolveFile("config.json")
+local EXAMPLE_FILE = resolveFile("config.json.example")
+local DASHBOARD_HTML = resolveFile("dashboard.html")
 local DEBUG_LOG = moduleDir .. "debug.log"
 
 local function logToFile(fmt, ...)
@@ -246,7 +251,7 @@ local function loadConfig()
   if ok and type(data) == "table" then
     return data
   end
-  log.w("Failed to read remote_config.json, returning empty config")
+  log.w("Failed to read modules/remote_control/config.json, returning empty config")
   return {}
 end
 
@@ -257,10 +262,10 @@ local function saveConfig(newConfig)
     hs.json.write(newConfig, CONFIG_FILE, true, true)
   end)
   if not ok then
-    log.ef("Failed to write remote_config.json: %s", tostring(err))
+    log.ef("Failed to write modules/remote_control/config.json: %s", tostring(err))
     return false
   end
-  log.i("remote_config.json saved successfully")
+  log.i("modules/remote_control/config.json saved successfully")
   return true
 end
 
@@ -1101,12 +1106,12 @@ end
 -- Listener fallback. Do NOT use pkill -f.
 -- ps columns: pid, comm (basename), args (full argv)
 local function reapOrphanListeners()
-  local bin = resolveFile("listener", "remote_hid_listener")
+  local bin = resolveFile("listener")
   local out = hs.execute("/bin/ps -Ao pid=,comm=,args=") or ""
   for line in out:gmatch("[^\n]+") do
     local pid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
     if pid and comm and args then
-      local isListener = (comm == "listener" or comm == "remote_hid_listener")
+      local isListener = (comm == "listener")
       local startsWithBin = (args:sub(1, #bin) == bin)
       local isSwift = args:find(".swift", 1, true) ~= nil
       if isListener and startsWithBin and not isSwift then
@@ -1136,8 +1141,8 @@ end
 local function startHidListener(forceApplyHidutil)
   killOwnListener()
 
-  local helperBin = resolveFile("listener", "remote_hid_listener")
-  local swiftSrc = resolveFile("listener.swift", "remote_hid_listener.swift")
+  local helperBin = resolveFile("listener")
+  local swiftSrc = resolveFile("listener.swift")
   if not fileExists(helperBin) and fileExists(swiftSrc) then
     log.i("listener binary not found, auto-compiling from Swift source...")
     hs.execute(string.format("swiftc -O '%s' -o '%s'", swiftSrc, helperBin))
@@ -1203,9 +1208,9 @@ local function startHidListener(forceApplyHidutil)
 
   state.hidTask = taskRef
   if state.hidTask:start() then
-    log.i("remote_hid_listener started successfully for Back button (0xF1)")
+    log.i("remote_control listener started successfully")
   else
-    log.ef("Failed to start remote_hid_listener task")
+    log.ef("Failed to start remote_control listener task")
     state.hidTask = nil
   end
 end

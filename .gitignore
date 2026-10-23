@@ -1,13 +1,9 @@
 # Private secrets & configurations
-voice_input_secret.lua
-voice_hotwords.lua
-remote_config.json
 **/secret.lua
 **/hotwords.lua
 **/config.json
 
 # Binaries & build artifacts
-remote_hid_listener
 **/listener
 **/native_guard
 modules/window_switcher/.native-hotkeys.json*
@@ -20,7 +16,5 @@ modules/window_switcher/.native-hotkeys.json*
 .DS_Store
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
-
-# Local workflow rollback snapshots (may contain personal config)
-backups/
