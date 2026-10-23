@@ -11,9 +11,13 @@
 -- (copy from hotwords.lua.example). That file is local and is
 -- not part of the project defaults.
 local M = {}
-local okTarget, InputTarget = pcall(require, "modules.input_target")
-if not okTarget or type(InputTarget) ~= "table" then
-  InputTarget = nil
+local InputTarget = nil
+local function getInputTarget()
+  if InputTarget == false then return nil end
+  if InputTarget ~= nil then return InputTarget end
+  local ok, mod = pcall(require, "modules.input_target")
+  InputTarget = (ok and type(mod) == "table") and mod or false
+  return InputTarget or nil
 end
 
 local log = hs.logger.new("voice-input", "debug")
@@ -1226,10 +1230,14 @@ function M.start(options)
   }
 
   local function shouldGuardTarget()
-    if state.guardInputTarget ~= nil then
-      return state.guardInputTarget == true and InputTarget ~= nil
+    local enabled = state.guardInputTarget
+    if enabled == nil then
+      enabled = (RemoteControl ~= nil)
     end
-    return InputTarget ~= nil and RemoteControl ~= nil
+    if not enabled then
+      return false
+    end
+    return getInputTarget() ~= nil
   end
 
   local function stopTimers()
